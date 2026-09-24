@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import socket
 import threading
+import time
 import unittest
 import urllib.request
 from importlib.machinery import SourceFileLoader
@@ -217,6 +218,111 @@ class ProxyTest(unittest.TestCase):
 
     def test_bad_port_refused(self):
         self.assertIn(b"403", self.ask(b"CONNECT example.com:25 HTTP/1.1\r\n\r\n"))
+
+
+class Trickle(http.server.BaseHTTPRequestHandler):
+    """Sends one byte every half second, forever (headers or body)."""
+    in_headers = False
+
+    def do_GET(self):
+        try:
+            head = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 999999\r\n\r\n"
+            if self.in_headers:
+                for byte in head:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.5)
+            self.wfile.write(head if not self.in_headers else b"")
+            while True:
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(0.5)
+        except OSError:
+            pass
+
+    def log_message(self, *args):
+        pass
+
+
+class DeadlineTest(unittest.TestCase):
+    """A server trickling bytes (or a hanging DNS lookup) can't hold a request
+    past its total deadline, although each read is well within the socket timeout."""
+
+    def setUp(self):
+        self.original = (hz.public_ip, hz.routes_to_this_machine, hz.ART_DEADLINE, hz.API_DEADLINE)
+        hz.public_ip = lambda a: a == "127.0.0.2" or self.original[0](a)
+        hz.routes_to_this_machine = lambda a: a != "127.0.0.2" and self.original[1](a)
+        hz.ART_DEADLINE = hz.API_DEADLINE = 2.0
+        self.servers = []
+
+    def tearDown(self):
+        hz.public_ip, hz.routes_to_this_machine, hz.ART_DEADLINE, hz.API_DEADLINE = self.original
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+
+    def trickle(self, in_headers):
+        handler = type("T", (Trickle,), {"in_headers": in_headers})
+        server = http.server.ThreadingHTTPServer(("127.0.0.2", 0), handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.servers.append(server)
+        return f"http://127.0.0.2:{server.server_address[1]}/"
+
+    def timed(self, fn):
+        start = time.monotonic()
+        result = fn()
+        return result, time.monotonic() - start
+
+    def test_trickled_body_is_cut_off(self):
+        url = self.trickle(in_headers=False)
+        with self.assertRaises(OSError):
+            start = time.monotonic()
+            try:
+                hz.bounded_read(hz.API_OPENER, urllib.request.Request(url), 10**6, 2.0)
+            finally:
+                self.assertLess(time.monotonic() - start, 3.5)
+
+    def test_trickled_headers_are_cut_off(self):
+        url = self.trickle(in_headers=True)
+        start = time.monotonic()
+        with self.assertRaises((OSError, hz.http.client.HTTPException)):
+            hz.bounded_read(hz.API_OPENER, urllib.request.Request(url), 10**6, 2.0)
+        self.assertLess(time.monotonic() - start, 3.5)
+
+    def test_artwork_worker_is_released(self):
+        url = self.trickle(in_headers=False)
+        art = hz.Artwork.__new__(hz.Artwork)
+        # The trickle server can't listen on 80/443 here, so lift the logo port
+        # limit for this test; otherwise the port check would refuse it first
+        # and the test would prove nothing about the deadline.
+        original = hz.ART_OPENER
+        hz.ART_OPENER = hz.guarded_opener()
+        try:
+            result, elapsed = self.timed(lambda: art.fetch("00000000-0000-0000-0000-000000000001", url))
+        finally:
+            hz.ART_OPENER = original
+        self.assertIsNone(result)
+        self.assertGreater(elapsed, 1.5, "must have reached the slow server")
+        self.assertLess(elapsed, 3.5)
+
+    def test_hanging_dns_lookup_is_cut_off(self):
+        real = socket.getaddrinfo
+        hz.socket.getaddrinfo = lambda *a, **k: (time.sleep(30), real(*a, **k))[1]
+        try:
+            start = time.monotonic()
+            with self.assertRaises(OSError):
+                hz.bounded_read(hz.API_OPENER, urllib.request.Request("http://example.com/"), 1000, 2.0)
+            self.assertLess(time.monotonic() - start, 3.5)
+        finally:
+            hz.socket.getaddrinfo = real
+
+    def test_fast_response_is_unaffected(self):
+        server, hits = serve("127.0.0.2")
+        self.servers.append(server)
+        body = hz.bounded_read(hz.API_OPENER, urllib.request.Request(
+            f"http://127.0.0.2:{server.server_address[1]}/ok"), 10**6, 2.0)
+        self.assertTrue(body.startswith(b"\x89PNG"))
 
 
 def online():

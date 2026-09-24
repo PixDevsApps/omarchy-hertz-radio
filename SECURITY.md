@@ -32,6 +32,13 @@ made by `public_connection()`:
   are refused; logos may only use ports 80 and 443.
 - Redirects are followed at most 3 times, each hop checked the same way,
   http/https only. No proxy, FTP or `file:` handlers are installed.
+- Every request has a **total** deadline, not just a per-read socket timeout:
+  15 s for a logo, 20 s per directory mirror and 45 s across mirrors. It
+  covers the name lookup, connect, redirects, headers and body. When it
+  passes, a watchdog shuts the request's sockets down (which also unblocks a
+  read waiting inside TLS) and the partial response is discarded, so a server
+  trickling bytes can't hold a download worker. The player proxy's lookup and
+  connect have the same 15 s deadline.
 
 ## Player sandbox
 
@@ -73,7 +80,9 @@ python3 -m unittest discover -s tests -v
 ```
 
 `tests/test_network_guard.py` covers the address policy, ports, redirects,
-the proxy's request handling, logo formats and the private folder check.
+the proxy's request handling, logo formats, the private folder check, and the
+total deadlines (servers trickling headers or body one byte at a time, and a
+hanging DNS lookup).
 `tests/test_player_sandbox.py` runs the real sandboxed player against hostile
 URLs (loopback, LAN address, public redirect to loopback, `.m3u` and HLS
 playlists pointing at loopback, raw `tcp://`) and asserts that a local server

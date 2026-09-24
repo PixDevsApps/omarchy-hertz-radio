@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1 — 2026-09-25
+
+- Every logo and directory request now has a total deadline (15 s per logo,
+  20 s per mirror, 45 s across mirrors) covering lookup, connect, redirects,
+  headers and body. A watchdog shuts the sockets down when it passes, so a
+  server trickling one byte per socket timeout can no longer hold the artwork
+  workers. The player proxy's lookup + connect are bounded the same way.
+  Reported in marketplace review.
+
 ## 1.1.0 — 2026-09-24
 
 Security review, prompted by marketplace review of 1.0.1.

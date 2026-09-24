@@ -50,7 +50,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
 HERE = os.path.dirname(os.path.realpath(__file__))
 
@@ -70,6 +70,9 @@ MERGE_CAP = 800   # merged (multi-query) results stop here; single queries page 
 MAX_PAGE = 250    # 10,000 stations is plenty for a scroll list
 MAX_BODY = 4 * 1024 * 1024
 MAX_ART = 768 * 1024
+API_DEADLINE = 20.0   # seconds for one whole directory request, per mirror
+API_TOTAL_DEADLINE = 45.0   # stop trying further mirrors after this long
+ART_DEADLINE = 15.0   # seconds for one whole logo download
 FALLBACK_MIRRORS = [
     "https://de1.api.radio-browser.info",
     "https://de2.api.radio-browser.info",
@@ -197,10 +200,115 @@ def routes_to_this_machine(address):
     return local
 
 
+# Total request deadlines. A socket timeout only bounds each read, so a server
+# that trickles one byte per timeout could hold a request (and a download
+# worker) forever. `Deadline` bounds the whole request: name lookup, connect,
+# every redirect hop, headers and body. When it expires, a watchdog shuts down
+# every socket the request opened, which also unblocks a read waiting inside
+# TLS, and whatever arrived is discarded.
+
+_active_deadline = threading.local()
+
+
+class Deadline:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.expires = time.monotonic() + seconds
+        self.expired = False
+        self.sockets = []
+        self.lock = threading.Lock()
+        self.timer = threading.Timer(seconds, self.expire)
+        self.timer.daemon = True
+
+    def remaining(self):
+        return self.expires - time.monotonic()
+
+    def check(self):
+        if self.expired or self.remaining() <= 0:
+            self.expired = True
+            raise TimeoutError(f"request exceeded {self.seconds:g} s")
+
+    def track(self, sock):
+        with self.lock:
+            self.sockets.append(sock)
+            expired = self.expired
+        if expired:
+            self._shut(sock)
+
+    def expire(self):
+        with self.lock:
+            self.expired = True
+            sockets = list(self.sockets)
+        for sock in sockets:
+            self._shut(sock)
+
+    @staticmethod
+    def _shut(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def __enter__(self):
+        self.previous = getattr(_active_deadline, "current", None)
+        _active_deadline.current = self
+        self.timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.timer.cancel()
+        _active_deadline.current = self.previous
+        return False
+
+
+def current_deadline():
+    return getattr(_active_deadline, "current", None)
+
+
+def bounded_read(opener, request, limit, seconds):
+    """Open `request` and read at most `limit` + 1 bytes, all within `seconds`.
+    Raises TimeoutError if the whole exchange takes longer."""
+    with Deadline(seconds) as deadline:
+        with opener.open(request, timeout=min(8, seconds)) as resp:
+            body = bytearray()
+            while len(body) <= limit:
+                deadline.check()
+                chunk = resp.read(min(65536, limit + 1 - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+        deadline.check()   # a watchdog shutdown can look like a clean EOF
+        return bytes(body)
+
+
+def _getaddrinfo(host, port):
+    deadline = current_deadline()
+    if deadline is None:
+        return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    # The system resolver has no per-call timeout; run it aside and stop
+    # waiting when the request's deadline is reached.
+    result = {}
+
+    def lookup():
+        try:
+            result["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except BaseException as e:  # handed back to the caller below
+            result["error"] = e
+    worker = threading.Thread(target=lookup, daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline.remaining()))
+    if worker.is_alive():
+        deadline.check()
+        raise TimeoutError(f"looking up {host} took too long")
+    if "error" in result:
+        raise result["error"]
+    return result["infos"]
+
+
 def resolve_public(host, port):
     """All addresses for host:port, or BlockedAddress if any is non-public."""
     try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        infos = _getaddrinfo(host, port)
     except (socket.gaierror, UnicodeError) as e:
         raise OSError(f"cannot resolve {host}") from e
     if not infos or len(infos) > MAX_ENDPOINTS * 3:
@@ -230,9 +338,15 @@ def public_connection(ports):
         last = None
         for family, kind, proto, _name, sockaddr in resolve_public(host, port):
             sock = socket.socket(family, kind, proto)
+            deadline = current_deadline()
             try:
+                if deadline is not None:
+                    deadline.check()
+                    deadline.track(sock)        # the watchdog can shut it down
+                    limit = deadline.remaining()
+                    timeout = limit if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else min(timeout, limit)
                 if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-                    sock.settimeout(timeout)
+                    sock.settimeout(max(0.01, timeout))
                 sock.connect(sockaddr)          # the address we just vetted
                 return sock
             except OSError as e:
@@ -388,7 +502,10 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
             header, pending = _read_header(client)
             method, host, port, forward = _parse_proxy_request(header)
             try:
-                upstream = public_connection(None)((host, port), timeout=15)
+                # Lookup + connect within one deadline; the stream itself then
+                # runs as long as the player wants it (idle limit in _relay).
+                with Deadline(15):
+                    upstream = public_connection(None)((host, port), timeout=15)
             except BlockedAddress:
                 raise ProxyRefused(b"403 Forbidden")
             except OSError:
@@ -659,12 +776,15 @@ class Directory:
             mirrors, start = list(self.mirrors), self.active
         query = ("?" + urllib.parse.urlencode(params)) if params else ""
         last = "Radio directory unavailable"
+        started = time.monotonic()
         for n in range(len(mirrors)):
+            if time.monotonic() - started > API_TOTAL_DEADLINE:
+                last = "Radio directory is not responding"
+                break
             index = (start + n) % len(mirrors)
             req = urllib.request.Request(mirrors[index] + path + query, headers={"User-Agent": USER_AGENT})
             try:
-                with API_OPENER.open(req, timeout=8) as resp:
-                    body = resp.read(MAX_BODY + 1)
+                body = bounded_read(API_OPENER, req, MAX_BODY, API_DEADLINE)
                 if len(body) > MAX_BODY:
                     raise ValueError("response too large")
                 data = json.loads(body)
@@ -890,9 +1010,7 @@ class Artwork:
                 return p
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with ART_OPENER.open(req, timeout=8) as resp:
-                ctype = resp.headers.get_content_type().lower()
-                body = resp.read(MAX_ART + 1)
+            body = bounded_read(ART_OPENER, req, MAX_ART, ART_DEADLINE)
         except (OSError, ValueError, http.client.HTTPException):
             return None
         ext = self.sniff(body)   # trust the bytes, not the server's Content-Type
