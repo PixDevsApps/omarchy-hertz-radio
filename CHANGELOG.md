@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.2.0 — 2026-09-25
+
+Full independent security audit; all findings fixed.
+
+- **Sandbox rebuilt from nothing.** mpv (and now the logo decoder) run with
+  only `/usr` and a few files from `/etc`. They get no home folder, no
+  session or system sockets (D-Bus, Wayland, X11, PipeWire, systemd, agents,
+  Docker), an empty environment, all namespaces unshared, nested user
+  namespaces disabled, no capabilities, and a seccomp filter. Previously the
+  whole filesystem was visible read-only, and sockets on it were reachable.
+- **Audio leaves the sandbox as raw PCM** played by `pw-cat`, so the player
+  needs no audio server or D-Bus access.
+- **MPRIS is published by hertz-ctl itself**, with the artist, song, station
+  and logo. `OpenUri` is refused.
+- **Logos are decoded only in the sandbox** (ffmpeg with pixel, memory, CPU
+  and time limits) and re-encoded to a ≤160×160 PNG. The shell never
+  decodes downloaded files. Old cached logos are removed.
+- **LAN protection:** destinations must be reached through a gateway on a
+  default-route interface. That also refuses LAN devices with public IPv6
+  addresses, and VPN-specific routes.
+- Resource limits inside the sandbox: 256 processes and threads and 1.5 GB of
+  address space for the player; the logo decoder is limited more tightly.
+  Player logs are capped.
+- The sandbox can write only to its own control folder. State, session and
+  logs are written through fresh temp files or with `O_NOFOLLOW`.
+- Every station record, including those read back from disk, is validated
+  by `clean_station()`.
+- mpv IPC lines are capped at 1 MiB; the directory API is HTTPS-only,
+  redirects included; the route checks respect request deadlines.
+- New tests: sandbox escape probe against every socket on the machine,
+  logo transcoding and decompression bombs, record validation, and IPC and
+  file robustness.
+
 ## 1.1.1 — 2026-09-25
 
 - Every logo and directory request now has a total deadline (15 s per logo,

@@ -25,6 +25,10 @@ _spec = spec_from_loader("hertz_ctl", _loader)
 hz = module_from_spec(_spec)
 _loader.exec_module(hz)
 
+# The directory API client is HTTPS-only; the local test servers speak plain
+# HTTP, so the address-policy tests use a guarded client that allows it.
+HTTP_OPENER = hz.guarded_opener()
+
 
 class Recorder(http.server.BaseHTTPRequestHandler):
     """Counts every request it receives; optionally redirects."""
@@ -88,7 +92,7 @@ class OpenerTest(unittest.TestCase):
         for url in [f"http://127.0.0.1:{p}/", f"http://localhost:{p}/", f"http://[::1]:{p}/",
                     f"http://2130706433:{p}/", f"http://0x7f000001:{p}/", f"http://127.1:{p}/",
                     f"http://[::ffff:127.0.0.1]:{p}/", f"http://0.0.0.0:{p}/"]:
-            self.assert_blocked(url, hz.API_OPENER)
+            self.assert_blocked(url, HTTP_OPENER)
             self.assert_blocked(url, hz.ART_OPENER)
         self.assertEqual(self.hits, [], "the local server must not receive any request")
 
@@ -110,7 +114,7 @@ class OpenerTest(unittest.TestCase):
         try:
             front, front_hits = serve("127.0.0.2", redirect_to=f"http://127.0.0.1:{self.port}/secret")
             try:
-                self.assert_blocked(f"http://127.0.0.2:{front.server_address[1]}/logo.png", hz.API_OPENER)
+                self.assert_blocked(f"http://127.0.0.2:{front.server_address[1]}/logo.png", HTTP_OPENER)
                 self.assertEqual(len(front_hits), 1, "the allowed host is reached once")
                 self.assertEqual(self.hits, [], "the redirect target must not be reached")
             finally:
@@ -133,6 +137,18 @@ class OpenerTest(unittest.TestCase):
         self.assertFalse(hz.public_stream("http://localhost:8000/"))
 
 
+class HttpsOnlyApiTest(unittest.TestCase):
+    def test_api_client_refuses_plain_http(self):
+        with self.assertRaises(OSError):
+            hz.API_OPENER.open(urllib.request.Request("http://example.com/"), timeout=3)
+
+    def test_api_client_refuses_https_to_http_redirect(self):
+        handler = [h for h in hz.API_OPENER.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)][0]
+        with self.assertRaises(hz.BlockedAddress):
+            handler.redirect_request(urllib.request.Request("https://example.com/"), None, 302, "Found",
+                                     {}, "http://example.com/downgraded")
+
+
 class PortTest(unittest.TestCase):
     def test_bad_ports_refused_before_any_lookup(self):
         for port in (22, 25, 53, 110, 143, 465, 587, 993, 6667, 0, 70000):
@@ -143,6 +159,24 @@ class PortTest(unittest.TestCase):
 class RouteTest(unittest.TestCase):
     def test_loopback_routes_locally(self):
         self.assertTrue(hz.routes_to_this_machine("127.0.0.1"))
+
+    @unittest.skipUnless(shutil.which("ip"), "needs iproute2")
+    def test_lan_and_own_addresses_are_refused_even_if_public(self):
+        # This machine's own addresses and anything directly on its LAN are
+        # refused, including LAN devices with global IPv6 addresses.
+        import ipaddress, json, subprocess
+        for family, probe in (("-4", "1.1.1.1"), ("-6", "2606:4700:4700::1111")):
+            out = subprocess.run(["ip", "-j", family, "route", "get", probe], capture_output=True, text=True)
+            try:
+                own = json.loads(out.stdout)[0].get("prefsrc")
+            except (ValueError, IndexError):
+                continue
+            if not own:
+                continue
+            self.assertTrue(hz.routes_to_this_machine(own), own)
+            neighbour = str(ipaddress.ip_interface(own + ("/64" if ":" in own else "/24")).network.network_address + 1)
+            if neighbour != own:
+                self.assertTrue(hz.routes_to_this_machine(neighbour), neighbour)
 
     @unittest.skipUnless(shutil.which("ip"), "needs iproute2")
     def test_public_address_is_not_local(self):
@@ -279,7 +313,7 @@ class DeadlineTest(unittest.TestCase):
         with self.assertRaises(OSError):
             start = time.monotonic()
             try:
-                hz.bounded_read(hz.API_OPENER, urllib.request.Request(url), 10**6, 2.0)
+                hz.bounded_read(HTTP_OPENER, urllib.request.Request(url), 10**6, 2.0)
             finally:
                 self.assertLess(time.monotonic() - start, 3.5)
 
@@ -287,7 +321,7 @@ class DeadlineTest(unittest.TestCase):
         url = self.trickle(in_headers=True)
         start = time.monotonic()
         with self.assertRaises((OSError, hz.http.client.HTTPException)):
-            hz.bounded_read(hz.API_OPENER, urllib.request.Request(url), 10**6, 2.0)
+            hz.bounded_read(HTTP_OPENER, urllib.request.Request(url), 10**6, 2.0)
         self.assertLess(time.monotonic() - start, 3.5)
 
     def test_artwork_worker_is_released(self):
@@ -312,7 +346,7 @@ class DeadlineTest(unittest.TestCase):
         try:
             start = time.monotonic()
             with self.assertRaises(OSError):
-                hz.bounded_read(hz.API_OPENER, urllib.request.Request("http://example.com/"), 1000, 2.0)
+                hz.bounded_read(HTTP_OPENER, urllib.request.Request("http://example.com/"), 1000, 2.0)
             self.assertLess(time.monotonic() - start, 3.5)
         finally:
             hz.socket.getaddrinfo = real
@@ -320,7 +354,7 @@ class DeadlineTest(unittest.TestCase):
     def test_fast_response_is_unaffected(self):
         server, hits = serve("127.0.0.2")
         self.servers.append(server)
-        body = hz.bounded_read(hz.API_OPENER, urllib.request.Request(
+        body = hz.bounded_read(HTTP_OPENER, urllib.request.Request(
             f"http://127.0.0.2:{server.server_address[1]}/ok"), 10**6, 2.0)
         self.assertTrue(body.startswith(b"\x89PNG"))
 

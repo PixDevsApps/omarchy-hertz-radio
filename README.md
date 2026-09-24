@@ -25,7 +25,7 @@ Hertz's genre map and artwork duotone, and follows the active Omarchy theme.
 | **Player** | Station artwork, live track title, play/pause, previous/next station, favorite and volume. |
 | **Browser** | Opens under the player. Search, 28 genres, a country picker (about 240 countries, filterable as you type), favorites, and a list that keeps loading as you scroll, from [Radio Browser](https://www.radio-browser.info). Genre, country and search combine, and the last genre and country are remembered. |
 | **Theme aware** | Uses the shell's colours, fonts, spacing and corner rounding. Logos go through a duotone shader: the playing station uses the theme accent, the others use its foreground. |
-| **Media keys** | Playback runs in `mpv` with `mpv-mpris`, so media keys and the `omarchy.media` widget work too. |
+| **Media keys** | Hertz Radio publishes MPRIS itself, so media keys and the `omarchy.media` widget show the artist, song, station and logo and can control playback. |
 | **Resilient** | The stream keeps playing across shell restarts. Results are cached when the directory is unreachable, and a failed stream stays selected with a retry button. |
 | **Private** | No accounts or tracking. A station's click is reported to Radio Browser only after playback actually starts, the same as the Hertz desktop app. |
 
@@ -69,9 +69,9 @@ omarchy bar move io.github.pixdevsapps.hertz-radio --section center
 omarchy bar move io.github.pixdevsapps.hertz-radio --before omarchy.audio
 ```
 
-Requirements: `python` (standard library only), `mpv`, `mpv-mpris`,
-`bubblewrap` and `iproute2`. All of them ship with Omarchy. Playback needs
-unprivileged user namespaces (the Arch default), which the player sandbox uses.
+Requirements: `python`, `python-gobject` (media keys), `mpv`, `ffmpeg`,
+`pipewire` (`pw-cat`), `bubblewrap` and `iproute2`. All of them ship with
+Omarchy. The sandbox needs unprivileged user namespaces (the Arch default).
 
 ## Using it
 
@@ -124,39 +124,47 @@ To bind the panel to a key, call its IPC target, for example
 ## How it works
 
 ```
-Panel.qml ──stdin: search / play / toggle / fav / volume …──▶ hertz-ctl daemon (python3)
-          ◀─stdout: JSON state, stations, artwork paths──────┘      │
-                                   Radio Browser mirrors (failover) ┤
-                                   mpv --idle over its IPC socket ──┴──▶ mpv-mpris ──▶ MPRIS
+Panel.qml ◀──JSON lines──▶ hertz-ctl daemon ──▶ Radio Browser API (HTTPS), logo downloads
+                               │    └────────▶ MPRIS (media keys, omarchy.media)
+                               ▼
+                    hertz-ctl player session
+                      ├─ guarded proxy ◀── the only network path out of the sandbox
+                      ├─ sandbox: mpv ── raw PCM ──▶ pw-cat ──▶ PipeWire
+                      └─ sandbox: ffmpeg (logo → small PNG, no network)
 ```
 
 - `hertz-ctl` handles the network, the files and the player. The QML only
   renders the snapshots it receives.
 - Radio Browser mirrors are discovered from `all.api.radio-browser.info` and
   tried in turn. Responses are size-capped, and only `http(s)` streams are accepted.
-- Logos are downloaded once into the cache (size- and type-checked) and tinted
-  on the GPU by `shaders/station-tint.frag`. Without a logo, the station's
-  initials are shown instead.
-- `mpv` runs in its own session. When the shell restarts, the new daemon
-  reattaches to the running stream. An idle player is shut down.
+- Logos are downloaded, turned into small PNGs in the sandbox, cached, and
+  tinted on the GPU by `shaders/station-tint.frag`. Without a logo, the
+  station's initials are shown instead.
+- The player session runs on its own. When the shell restarts, the new
+  daemon reattaches to the running stream. An idle player is shut down.
 
-### Security
+### Security and privacy
 
-Station data comes from a public, community-edited directory, so station
-names, logo and stream URLs, and whatever a stream sends back are treated as
-untrusted:
+Station data comes from a public, community-edited directory, so everything
+in it, and everything a stream or logo server sends back, is treated as
+hostile:
 
-- **Logos and the directory API** are fetched only from public internet
-  addresses. Every resolved address is checked, the connection goes to exactly
-  that address, redirect hops are re-checked, and logos must be PNG, JPEG, GIF,
-  WebP, ICO or BMP.
-- **The player (mpv) runs in a sandbox with no network of its own.** Its only
-  way out is a small proxy that applies the same public-address check to every
-  request, so redirects, playlists and HLS segments can't reach `localhost`,
-  your LAN or cloud metadata addresses. Stream TLS certificates are verified.
-- Names and titles are shown as plain text, and no shell is ever used.
+- **The player (mpv) and the logo decoder (ffmpeg) run in a sandbox that
+  starts from nothing.** They get no home folder, none of your session's
+  sockets (D-Bus, Wayland, PipeWire, Docker…), no capabilities, a
+  syscall filter and resource limits. Audio leaves as raw samples played by
+  `pw-cat`; the network is reachable only through a proxy that allows public
+  internet addresses and nothing on your machine or LAN.
+- **Logos are re-encoded in that sandbox** into a small PNG, so the shell
+  never decodes a file from the internet.
+- Every request has a total time limit, every station record is validated,
+  and names and titles are shown as plain text.
 
-The details, threat model and tests are in [SECURITY.md](SECURITY.md).
+Browsing fetches station lists from Radio Browser and each listed station's
+logo from its own server. Playing reports the play to Radio Browser. There
+are no accounts or tracking.
+
+Details, remaining risks and the tests are in [SECURITY.md](SECURITY.md).
 `python3 -m unittest discover -s tests -v` runs the tests.
 
 ## Files it writes
@@ -164,7 +172,7 @@ The details, threat model and tests are in [SECURITY.md](SECURITY.md).
 | Path | Contents |
 |---|---|
 | `~/.local/share/hertz-radio/state.json` | Favorites, volume, last station, genre and country |
-| `~/.cache/hertz-radio/` | Station logos and recent result lists |
+| `~/.cache/hertz-radio/` | Station logos (small PNGs) and recent result lists |
 | `$XDG_RUNTIME_DIR/hertz-radio/` | mpv socket and the current session |
 
 ## Remove

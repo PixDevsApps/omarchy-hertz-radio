@@ -84,11 +84,11 @@ class PlayerSandboxTest(unittest.TestCase):
         # Short runtime path: Unix socket paths are limited to 108 bytes.
         cls.runtime = tempfile.mkdtemp(prefix="hzt-", dir=f"/run/user/{os.getuid()}")
         cls.data = tempfile.mkdtemp(prefix="hertz-radio-test-")
-        env = dict(os.environ, XDG_RUNTIME_DIR=cls.runtime, XDG_DATA_HOME=cls.data,
-                   XDG_CACHE_HOME=cls.data, PIPEWIRE_RUNTIME_DIR=f"/run/user/{os.getuid()}")
+        env = dict(os.environ, HERTZ_RADIO_RUNTIME=cls.runtime, XDG_DATA_HOME=cls.data,
+                   XDG_CACHE_HOME=cls.data)
         cls.player = subprocess.Popen(["python3", CTL, "player", "0"], env=env,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        cls.mpv_sock = os.path.join(cls.runtime, "hertz-radio", "mpv.sock")
+        cls.mpv_sock = os.path.join(cls.runtime, "player", "mpv.sock")
         for _ in range(200):
             if os.path.exists(cls.mpv_sock):
                 break

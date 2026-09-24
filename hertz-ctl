@@ -28,7 +28,6 @@ Other entry points, handy for testing: `hertz-ctl search <text>`,
 """
 
 import errno
-import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -36,6 +35,7 @@ import json
 import os
 import queue
 import random
+import re
 import select
 import shutil
 import signal
@@ -44,23 +44,26 @@ import socketserver
 import stat
 import struct
 import subprocess
+import tempfile
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
 HERE = os.path.dirname(os.path.realpath(__file__))
 
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "hertz-radio")
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "hertz-radio")
 # Per-user runtime dir; never a predictable path in the shared /tmp.
-RUNTIME = (os.path.join(os.environ["XDG_RUNTIME_DIR"], "hertz-radio")
-           if os.environ.get("XDG_RUNTIME_DIR") else os.path.join(CACHE, "run"))
-ART_DIR = os.path.join(CACHE, "art")
-SOCKET = os.path.join(RUNTIME, "mpv.sock")
+RUNTIME = (os.environ.get("HERTZ_RADIO_RUNTIME")      # tests only: a separate player folder
+           or (os.path.join(os.environ["XDG_RUNTIME_DIR"], "hertz-radio")
+               if os.environ.get("XDG_RUNTIME_DIR") else os.path.join(CACHE, "run")))
+ART_DIR = os.path.join(CACHE, "logos")   # sandbox-transcoded PNGs only
+PLAYER_DIR = os.path.join(RUNTIME, "player")   # the sandbox's only writable dir
+SOCKET = os.path.join(PLAYER_DIR, "mpv.sock")
 SESSION_FILE = os.path.join(RUNTIME, "session.json")
 STATE_FILE = os.path.join(DATA, "state.json")
 LIST_CACHE = os.path.join(CACHE, "lists.json")
@@ -70,6 +73,7 @@ MERGE_CAP = 800   # merged (multi-query) results stop here; single queries page 
 MAX_PAGE = 250    # 10,000 stations is plenty for a scroll list
 MAX_BODY = 4 * 1024 * 1024
 MAX_ART = 768 * 1024
+MAX_IPC_LINE = 1024 * 1024   # longest mpv IPC message accepted
 API_DEADLINE = 20.0   # seconds for one whole directory request, per mirror
 API_TOTAL_DEADLINE = 45.0   # stop trying further mirrors after this long
 ART_DEADLINE = 15.0   # seconds for one whole logo download
@@ -104,11 +108,20 @@ def log(*parts):
 
 
 def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    """Atomic write through a fresh, exclusively created temp file."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_json(path, fallback):
@@ -177,27 +190,54 @@ _route_cache = {}
 _route_lock = threading.Lock()
 
 
-def routes_to_this_machine(address):
-    """True if the kernel would deliver this address locally (e.g. one of this
-    machine's own public IPs). Fails closed if the route can't be checked."""
+def _ip_json(*args):
+    out = subprocess.run(["ip", "-j", *args], capture_output=True, stdin=subprocess.DEVNULL,
+                         timeout=2, check=False)
+    data = json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else []
+    return data if isinstance(data, list) else []
+
+
+def _cached(key, compute):
     now = time.monotonic()
     with _route_lock:
-        hit = _route_cache.get(address)
+        hit = _route_cache.get(key)
         if hit and now - hit[1] < 60:
             return hit[0]
-    try:
-        out = subprocess.run(["ip", "-j", "route", "get", address], capture_output=True,
-                             stdin=subprocess.DEVNULL, timeout=2, check=False)
-        routes = json.loads(out.stdout) if out.returncode == 0 else None
-        local = not isinstance(routes, list) or any(
-            isinstance(r, dict) and (r.get("type") == "local" or r.get("dev") == "lo") for r in routes)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        local = True
+    value = compute()
     with _route_lock:
         if len(_route_cache) > 512:
             _route_cache.clear()
-        _route_cache[address] = (local, now)
-    return local
+        _route_cache[key] = (value, now)
+    return value
+
+
+def _default_devices(family):
+    return _cached(("default", family), lambda: frozenset(
+        r.get("dev") for r in _ip_json(family, "route", "show", "default")
+        if isinstance(r, dict) and r.get("dev")))
+
+
+def routes_to_this_machine(address):
+    """True unless the kernel would send `address` out through a gateway on an
+    interface that carries a default route. That refuses this machine's own
+    addresses, anything directly on the LAN (including LAN devices with
+    public IPv6 addresses) and specific routes into VPNs or other networks.
+    Fails closed if routing can't be read."""
+    def compute():
+        try:
+            family = "-6" if ":" in address else "-4"
+            routes = _ip_json(family, "route", "get", address)
+            defaults = _default_devices(family)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return True
+        if not routes or not defaults:
+            return True
+        for r in routes:
+            if not isinstance(r, dict) or r.get("type") in ("local", "broadcast", "multicast") \
+                    or r.get("dev") == "lo" or not r.get("gateway") or r.get("dev") not in defaults:
+                return True
+        return False
+    return _cached(("route", address), compute)
 
 
 # Total request deadlines. A socket timeout only bounds each read, so a server
@@ -311,9 +351,12 @@ def resolve_public(host, port):
         infos = _getaddrinfo(host, port)
     except (socket.gaierror, UnicodeError) as e:
         raise OSError(f"cannot resolve {host}") from e
-    if not infos or len(infos) > MAX_ENDPOINTS * 3:
+    if not infos or len(infos) > MAX_ENDPOINTS:
         raise BlockedAddress(f"{host} did not resolve to a usable address")
+    deadline = current_deadline()
     for info in infos:
+        if deadline is not None:
+            deadline.check()
         address = info[4][0].split("%", 1)[0]
         if not public_ip(address) or routes_to_this_machine(address):
             raise BlockedAddress(f"{host} is not a public internet address")
@@ -356,7 +399,7 @@ def public_connection(ports):
     return create_connection
 
 
-def guarded_opener(ports=None):
+def guarded_opener(ports=None, https_only=False):
     class GuardedHTTP(http.client.HTTPConnection):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -379,18 +422,19 @@ def guarded_opener(ports=None):
         max_redirections = 3
 
         def redirect_request(self, req, fp, code, msg, headers, newurl):
-            if urllib.parse.urlsplit(newurl).scheme not in ("http", "https"):
+            if urllib.parse.urlsplit(newurl).scheme not in (("https",) if https_only else ("http", "https")):
                 raise BlockedAddress("redirect to a non-HTTP address")
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
     opener = urllib.request.OpenerDirector()
     for handler in (urllib.request.UnknownHandler(), urllib.request.HTTPDefaultErrorHandler(),
-                    Redirects(), urllib.request.HTTPErrorProcessor(), HTTPHandler(), HTTPSHandler()):
+                    Redirects(), urllib.request.HTTPErrorProcessor(), HTTPSHandler(),
+                    *(() if https_only else (HTTPHandler(),))):
         opener.add_handler(handler)
     return opener
 
 
-API_OPENER = guarded_opener()                 # Radio Browser mirrors (HTTPS)
+API_OPENER = guarded_opener(https_only=True)  # Radio Browser mirrors: HTTPS, redirects too
 ART_OPENER = guarded_opener(ports=(80, 443))  # station logos: untrusted URLs
 
 
@@ -579,77 +623,187 @@ class _Bridge(_LimitedServer, socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), _BridgeHandler)
 
 
+# ---- the sandbox itself (used for the player and for decoding logos)
+#
+# bubblewrap builds an empty mount namespace: /usr read-only, the host's
+# /bin, /lib symlinks, and only the loader/TLS files needed from /etc. There
+# is no /home, a private empty /tmp and /run, an empty environment, new
+# user/pid/net/ipc/uts/cgroup namespaces (bubblewrap brings up loopback), no
+# nested user namespaces, no capabilities, and a seccomp filter. Nothing from
+# the user's session is reachable: no D-Bus, Wayland, X11, PipeWire, agents,
+# Docker or systemd sockets, no personal files.
+
+SANDBOX_ETC = ("/etc/ld.so.cache", "/etc/ssl", "/etc/ca-certificates", "/etc/pkcs11",
+               "/etc/gnutls", "/etc/localtime", "/etc/fonts")
+SANDBOX_RUN = "/run/hertz"                 # the player's control dir inside the sandbox
+SANDBOX_PROXY = "/run/hertz-proxy.sock"    # the proxy socket inside the sandbox
+SANDBOX_SCRIPT = "/opt/hertz-radio/hertz-ctl"
+
+# x86_64 syscalls refused inside the sandbox (EPERM), clone3 answers ENOSYS so
+# libc falls back to clone. Any other architecture/ABI (i386 via int 0x80,
+# x32) is killed, so the list can't be sidestepped.
+_SECCOMP_DENY = (101, 103, 134, 153, 155, 161, 163, 165, 166, 167, 168, 169, 170, 171,
+                 172, 173, 175, 176, 179, 212, 246, 248, 249, 250, 272, 298, 300, 303,
+                 304, 308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428, 429,
+                 430, 431, 432, 433, 442)
+_SECCOMP_ENOSYS = (435,)
+
+
+def seccomp_program():
+    """Classic-BPF seccomp filter for bwrap --seccomp, or None off x86_64."""
+    if os.uname().machine != "x86_64":
+        return None
+    AUDIT_ARCH_X86_64 = 0xC000003E
+    LD, JEQ, JGE, RET = 0x20, 0x15, 0x35, 0x06
+    ALLOW, KILL, ERRNO = 0x7FFF0000, 0x80000000, 0x00050000
+    prog = [(LD, 0, 0, 4),                         # A = arch
+            (JEQ, 1, 0, AUDIT_ARCH_X86_64),
+            (RET, 0, 0, KILL),
+            (LD, 0, 0, 0),                         # A = syscall number
+            (JGE, 0, 1, 0x40000000),               # x32 ABI
+            (RET, 0, 0, KILL)]
+    for nr in _SECCOMP_DENY:
+        prog += [(JEQ, 0, 1, nr), (RET, 0, 0, ERRNO | errno.EPERM)]
+    for nr in _SECCOMP_ENOSYS:
+        prog += [(JEQ, 0, 1, nr), (RET, 0, 0, ERRNO | errno.ENOSYS)]
+    prog.append((RET, 0, 0, ALLOW))
+    return b"".join(struct.pack("=HBBI", *ins) for ins in prog)
+
+
+def sandbox_command(extra_binds=(), extra_env=()):
+    """bwrap argument list (without the command) and the fds it needs."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise OSError("bubblewrap (bwrap) is required")
+    cmd = [bwrap, "--unshare-all", "--unshare-user", "--disable-userns", "--cap-drop", "ALL",
+           "--die-with-parent", "--new-session", "--clearenv",
+           "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp",
+           "--setenv", "LANG", "C.UTF-8",
+           "--ro-bind", "/usr", "/usr",
+           "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
+           "--dir", "/etc", "--dir", "/opt/hertz-radio",
+           "--ro-bind", os.path.realpath(__file__), SANDBOX_SCRIPT]
+    for link in ("/bin", "/sbin", "/lib", "/lib64"):
+        if os.path.islink(link):
+            cmd += ["--symlink", os.readlink(link), link]
+    for path in SANDBOX_ETC:
+        cmd += ["--ro-bind-try", path, path]
+    for mode, src, dst in extra_binds:
+        cmd += [mode, src, dst]
+    for name, value in extra_env:
+        cmd += ["--setenv", name, value]
+    fds = []
+    program = seccomp_program()
+    if program is not None:
+        r, w = os.pipe()
+        os.write(w, program)
+        os.close(w)
+        cmd += ["--seccomp", str(r)]
+        fds.append(r)
+    return cmd, fds
+
+
 def mpv_arguments(volume):
-    return ["mpv", "--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
-            f"--input-ipc-server={SOCKET}", f"--volume={volume}", "--volume-max=100",
+    # No config, scripts or yt-dlp; decoded audio leaves as raw PCM on stdout
+    # (played by pw-cat outside the sandbox), so the player needs no audio
+    # server, no D-Bus and no session sockets at all.
+    return ["mpv", "--no-config", "--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
+            f"--input-ipc-server={SANDBOX_RUN}/mpv.sock", f"--volume={volume}", "--volume-max=100",
+            "--ao=pcm", "--ao-pcm-file=/dev/stdout", "--ao-pcm-waveheader=no",
+            f"--audio-format={PCM_FORMAT}", f"--audio-samplerate={PCM_RATE}",
+            f"--audio-channels={PCM_CHANNELS}",
             "--cache=yes", "--cache-secs=20", "--demuxer-max-bytes=8MiB",
             "--network-timeout=12", "--user-agent=" + USER_AGENT,
-            "--title=Hertz Radio", "--audio-client-name=hertz-radio",
             "--ytdl=no", "--load-unsafe-playlists=no", "--tls-verify=yes",
             "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5"]
 
 
+PCM_FORMAT, PCM_RATE, PCM_CHANNELS = "s16", 48000, "stereo"
+PLAYER_MEMORY = 1536 * 1024 * 1024   # mpv address space (it reserves ~720 MB, uses ~120 MB)
+SANDBOX_TASKS = 256                   # processes + threads, counted inside the sandbox only
+PLAYER_LOG_LIMIT = 256 * 1024
+
+
+def _capped_log(stream, path):
+    """Copy a child's stderr to `path`, keeping only the first 256 KiB."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        fd = None
+    written = 0
+    for chunk in iter(lambda: stream.read(8192), b""):
+        if fd is not None and written < PLAYER_LOG_LIMIT:
+            part = chunk[:PLAYER_LOG_LIMIT - written]
+            os.write(fd, part)
+            written += len(part)
+    if fd is not None:
+        os.close(fd)
+
+
 def run_player(volume):
-    """`hertz-ctl player`: guarded proxy + sandboxed mpv, for as long as mpv runs."""
+    """`hertz-ctl player`: guarded proxy + sandboxed mpv + pw-cat, while mpv runs."""
     os.umask(0o077)
     private_dir(RUNTIME)
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        log("player: bubblewrap (bwrap) is required to sandbox playback")
+    control = private_dir(PLAYER_DIR)      # the only writable path inside the sandbox
+    pw_cat = shutil.which("pw-cat")
+    if not pw_cat:
+        log("player: pw-cat (pipewire) is required for audio output")
         return 3
     proxy_path = os.path.join(RUNTIME, "proxy.sock")
-    if os.path.lexists(proxy_path):
-        if not stat.S_ISSOCK(os.lstat(proxy_path).st_mode):
-            log("player: proxy path exists and is not a socket")
-            return 3
-        os.unlink(proxy_path)
+    for stale in (proxy_path, SOCKET):
+        if os.path.lexists(stale):
+            if not stat.S_ISSOCK(os.lstat(stale).st_mode):
+                log(f"player: {stale} exists and is not a socket")
+                return 3
+            os.unlink(stale)
     proxy = GuardedProxy(proxy_path)
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
-    # bubblewrap: read-only filesystem except the private runtime dir, a
-    # minimal /dev, own PID namespace, dies with this session. The network
-    # namespace is set up by `sandbox-net` below.
-    cmd = [bwrap, "--unshare-pid", "--die-with-parent", "--new-session",
-           "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-           "--bind", RUNTIME, RUNTIME,
-           "--", sys.executable, os.path.realpath(__file__), "sandbox-net", proxy_path, "--",
-           *mpv_arguments(volume)]
     try:
-        return subprocess.run(cmd, stdin=subprocess.DEVNULL).returncode
+        cmd, fds = sandbox_command([("--bind", control, SANDBOX_RUN),
+                                    ("--ro-bind", proxy_path, SANDBOX_PROXY)],
+                                   extra_env=[("MALLOC_ARENA_MAX", "2")])
+    except OSError as e:
+        log(f"player: {e}")
+        return 3
+    cmd += ["--", "python3", SANDBOX_SCRIPT, "sandbox", SANDBOX_PROXY, "--", *mpv_arguments(volume)]
+    audio = None
+    try:
+        sandbox = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, pass_fds=fds)
+        for fd in fds:
+            os.close(fd)
+        threading.Thread(target=_capped_log, args=(sandbox.stderr, os.path.join(RUNTIME, "player.log")),
+                         daemon=True).start()
+        audio = subprocess.Popen([pw_cat, "--playback", "--raw", "--rate", str(PCM_RATE),
+                                  "--channels", "2", "--format", PCM_FORMAT, "--media-role", "Music",
+                                  "-P", '{ application.name = "Hertz Radio" node.description = "Hertz Radio" }',
+                                  "-"], stdin=sandbox.stdout, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        sandbox.stdout.close()           # pw-cat owns the read end now
+        return sandbox.wait()
     finally:
+        if audio is not None:
+            audio.terminate()
+            try:
+                audio.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                audio.kill()
         proxy.shutdown()
         proxy.server_close()
-        try:
-            os.unlink(proxy_path)
-        except OSError:
-            pass
-
-
-def run_sandbox_net(proxy_path, mpv_cmd):
-    """`hertz-ctl sandbox-net`: enter a new user + network namespace that holds
-    only a loopback interface, then re-exec as `sandbox`. The re-exec runs as
-    the normal (non-root) user, so the kernel clears every capability."""
-    uid, gid = os.getuid(), os.getgid()
-    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET)
-    with open("/proc/self/setgroups", "w") as f:
-        f.write("deny")
-    with open("/proc/self/uid_map", "w") as f:
-        f.write(f"{uid} {uid} 1")
-    with open("/proc/self/gid_map", "w") as f:
-        f.write(f"{gid} {gid} 1")
-    siocgifflags, siocsifflags, iff_up = 0x8913, 0x8914, 0x1
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        ifr = struct.pack("16sh14x", b"lo", 0)
-        flags = struct.unpack("16sh14x", fcntl.ioctl(s, siocgifflags, ifr))[1]
-        fcntl.ioctl(s, siocsifflags, struct.pack("16sh14x", b"lo", flags | iff_up))
-    script = os.path.realpath(__file__)
-    os.execv(sys.executable, [sys.executable, script, "sandbox", proxy_path, "--", *mpv_cmd])
+        for path in (proxy_path, SOCKET):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def sandbox_is_sealed():
     """Refuse to run the player unless it has no capabilities and no route out."""
     with open("/proc/self/status") as f:
         caps = {k: v.strip() for k, v in (line.split(":", 1) for line in f if line.startswith("Cap"))}
-    if any(int(caps.get(k, "0"), 16) for k in ("CapEff", "CapPrm", "CapAmb")):
+    if any(int(caps.get(k, "0"), 16) for k in ("CapEff", "CapPrm", "CapAmb", "CapBnd")):
+        return False
+    if os.path.exists("/home") and os.listdir("/home"):
         return False
     for family, address in ((socket.AF_INET, ("1.1.1.1", 443)), (socket.AF_INET6, ("2606:4700:4700::1111", 443))):
         try:
@@ -664,17 +818,69 @@ def sandbox_is_sealed():
 
 
 def run_sandbox(proxy_path, mpv_cmd):
-    """`hertz-ctl sandbox` (inside the namespaces): start the bridge, run mpv through it."""
+    """`hertz-ctl sandbox` (inside bubblewrap): check the seal, start the bridge, run mpv."""
     if not sandbox_is_sealed():
-        log("sandbox: isolation check failed; refusing to start the player")
+        print("hertz-ctl: sandbox isolation check failed; refusing to start the player", file=sys.stderr)
         return 4
+    import resource
+    # The sandbox has its own user namespace, so this counts only its own
+    # processes and threads.
+    resource.setrlimit(resource.RLIMIT_NPROC, (SANDBOX_TASKS, SANDBOX_TASKS))
     bridge = _Bridge(proxy_path)
     threading.Thread(target=bridge.serve_forever, daemon=True).start()
     proxy_url = f"http://127.0.0.1:{bridge.server_address[1]}"
     env = dict(os.environ, http_proxy=proxy_url, https_proxy=proxy_url,
                HTTP_PROXY=proxy_url, HTTPS_PROXY=proxy_url, no_proxy="", NO_PROXY="")
+    def limits():
+        resource.setrlimit(resource.RLIMIT_AS, (PLAYER_MEMORY, PLAYER_MEMORY))
     return subprocess.run([*mpv_cmd, f"--http-proxy={proxy_url}"], env=env,
-                          stdin=subprocess.DEVNULL).returncode
+                          stdin=subprocess.DEVNULL, preexec_fn=limits).returncode
+
+
+def transcode_logo(data):
+    """Decode an untrusted logo inside the sandbox (no network at all) and
+    return a small PNG, or None. The shell then only ever decodes our PNG."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or len(data) > MAX_ART:
+        return None
+    try:
+        # One malloc arena keeps ffmpeg's per-thread reservations small enough
+        # for a hard address-space limit.
+        cmd, fds = sandbox_command(extra_env=[("MALLOC_ARENA_MAX", "1")])
+    except OSError:
+        return None
+    cmd += ["--", "prlimit", "--nproc=32", "--", "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
+            "-max_pixels", str(LOGO_MAX_PIXELS), "-i", "pipe:0", "-frames:v", "1", "-map", "0:v:0",
+            "-filter_threads", "1",
+            "-vf", f"scale={LOGO_SIZE}:{LOGO_SIZE}:force_original_aspect_ratio=decrease:flags=area,format=rgba",
+            "-threads", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1"]
+
+    def limits():
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (LOGO_MEMORY, LOGO_MEMORY))
+        resource.setrlimit(resource.RLIMIT_STACK, (2 << 20, 2 << 20))
+        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+    try:
+        out = subprocess.run(cmd, input=data, capture_output=True, timeout=LOGO_TIMEOUT,
+                             pass_fds=fds, preexec_fn=limits)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        for fd in fds:
+            os.close(fd)
+    png = out.stdout
+    if out.returncode != 0 or not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > 256 * 1024:
+        return None
+    width, height = struct.unpack(">II", png[16:24])
+    if not (0 < width <= LOGO_SIZE and 0 < height <= LOGO_SIZE):
+        return None
+    return png
+
+
+LOGO_SIZE = 160
+LOGO_MAX_PIXELS = 4096 * 4096
+LOGO_MEMORY = 512 * 1024 * 1024
+LOGO_TIMEOUT = 15
 
 
 def private_dir(path):
@@ -909,12 +1115,12 @@ def slim(row):
         return None
     tags = [t.strip() for t in str(row.get("tags") or "").split(",") if t.strip()]
     favicon = str(row.get("favicon") or "")
-    return {
+    return clean_station({
         "uuid": uuid,
-        "name": " ".join(str(row.get("name") or "Unnamed station").split())[:120],
+        "name": row.get("name") or "Unnamed station",
         "url": url,
-        "favicon": favicon if http_url(favicon) else "",
-        "homepage": str(row.get("homepage") or "")[:300],
+        "favicon": favicon,
+        "homepage": row.get("homepage") or "",
         "tags": tags[:4],
         "genre": genre_label(tags, str(row.get("country") or ""),
                              [str(row.get("state") or "")] + str(row.get("language") or "").split(",")),
@@ -923,8 +1129,63 @@ def slim(row):
         "codec": str(row.get("codec") or "").upper()[:12],
         "bitrate": sane_bitrate(row.get("bitrate")),
         "hls": bool(row.get("hls")),
-        "clicks": int(row.get("clickcount") or 0),
+        "clicks": row.get("clickcount"),
+    })
+
+
+def _text(value, limit):
+    """Single-line printable text: control characters and newlines become spaces."""
+    text = "".join(c if c.isprintable() else " " for c in str(value if value is not None else ""))
+    return " ".join(text.split())[:limit]
+
+
+def _int(value, low=0, high=10**12):
+    try:
+        return max(low, min(high, int(value or 0)))
+    except (TypeError, ValueError):
+        return low
+
+
+def clean_station(d):
+    """The one gate for station records, whether fresh from the directory or
+    read back from favorites, the session file or the result cache."""
+    if not isinstance(d, dict):
+        return None
+    uuid, url = d.get("uuid"), d.get("url")
+    if not isinstance(uuid, str) or not valid_uuid(uuid):
+        return None
+    if not isinstance(url, str) or len(url) > 2048 or not http_url(url):
+        return None
+    favicon = d.get("favicon")
+    favicon = favicon if isinstance(favicon, str) and len(favicon) <= 2048 and http_url(favicon) else ""
+    tags = d.get("tags") if isinstance(d.get("tags"), list) else []
+    code = d.get("countrycode")
+    return {
+        "uuid": uuid.lower(),
+        "name": _text(d.get("name"), 120) or "Unnamed station",
+        "url": url,
+        "favicon": favicon,
+        "homepage": _text(d.get("homepage"), 300),
+        "tags": [t for t in (_text(t, 40) for t in tags[:8] if isinstance(t, str)) if t][:4],
+        "genre": _text(d.get("genre"), 40),
+        "country": _text(d.get("country"), 60),
+        "countrycode": code.upper() if isinstance(code, str) and valid_country(code.upper()) else "",
+        "codec": _text(d.get("codec"), 12).upper(),
+        "bitrate": _int(d.get("bitrate"), 0, 4000),
+        "hls": d.get("hls") is True,
+        "clicks": _int(d.get("clicks")),
     }
+
+
+def clean_stations(items, limit=1000):
+    out = []
+    for item in items if isinstance(items, list) else []:
+        station = clean_station(item)
+        if station:
+            out.append(station)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ------------------------------------------------------------------ artwork
@@ -933,11 +1194,9 @@ def slim(row):
 class Artwork:
     """Downloads station logos into the cache on a few worker threads."""
 
-    TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/gif": ".gif",
-             "image/webp": ".webp", "image/x-icon": ".ico",
-             "image/vnd.microsoft.icon": ".ico", "image/bmp": ".bmp"}
 
-    def __init__(self):
+    def __init__(self, on_ready=None):
+        self.on_ready = on_ready
         self.jobs = queue.Queue()
         self.known = {}  # uuid -> path or "" (failed)
         self.lock = threading.Lock()
@@ -953,10 +1212,9 @@ class Artwork:
         """Keep the logo cache bounded: drop the least recently used files."""
         try:
             entries = []
+            # Logos from before 1.2 were stored as downloaded; drop them.
+            shutil.rmtree(os.path.join(CACHE, "art"), ignore_errors=True)
             for e in os.scandir(ART_DIR):
-                if e.name.endswith(".svg"):      # no longer displayed (see sniff)
-                    os.unlink(e.path)
-                    continue
                 if e.is_file(follow_symlinks=False):
                     st = e.stat(follow_symlinks=False)
                     entries.append((st.st_atime, st.st_size, e.path))
@@ -998,29 +1256,49 @@ class Artwork:
                 log("artwork:", repr(e))
                 path = None
             with self.lock:
+                if len(self.known) > 20000:
+                    self.known.clear()
                 self.known[uuid] = path or ""
             if path:
                 emit({"type": "art", "uuid": uuid, "path": path})
+                if self.on_ready:
+                    self.on_ready(uuid)
+
+    def path_for(self, uuid):
+        with self.lock:
+            return self.known.get(uuid) or ""
 
     def fetch(self, uuid, url):
+        if not valid_uuid(uuid):
+            return None
         key = hashlib.sha1(url.encode()).hexdigest()[:16]
-        for ext in set(self.TYPES.values()):
-            p = os.path.join(ART_DIR, f"{uuid}-{key}{ext}")
-            if os.path.exists(p):
-                return p
+        path = os.path.join(ART_DIR, f"{uuid}-{key}.png")
+        if os.path.isfile(path) and not os.path.islink(path):
+            return path
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             body = bounded_read(ART_OPENER, req, MAX_ART, ART_DEADLINE)
         except (OSError, ValueError, http.client.HTTPException):
             return None
-        ext = self.sniff(body)   # trust the bytes, not the server's Content-Type
-        if not ext or len(body) > MAX_ART or len(body) < 16:
+        # Only known raster formats are even handed to the decoder, and the
+        # decoding itself happens in the sandbox (transcode_logo). What the
+        # shell displays is always the small PNG produced there.
+        if not self.sniff(body) or len(body) > MAX_ART or len(body) < 16:
             return None
-        path = os.path.join(ART_DIR, f"{uuid}-{key}{ext}")
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(body)
-        os.replace(tmp, path)
+        png = transcode_logo(body)
+        if png is None:
+            return None
+        fd, tmp = tempfile.mkstemp(dir=ART_DIR, prefix=".tmp-", suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(png)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return None
         return path
 
     @staticmethod
@@ -1083,12 +1361,17 @@ class Mpv:
         except OSError as e:
             emit({"type": "error", "message": f"Runtime folder is not private: {e}"})
             return False
-        # Sandboxed player session: see run_player().
+        # Sandboxed player session (see run_player); its resource limits are
+        # applied inside the sandbox (see run_sandbox).
         cmd = [sys.executable, os.path.realpath(__file__), "player", str(volume)]
         try:
-            with open(os.path.join(RUNTIME, "player.log"), "ab") as log_file:
-                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_file,
-                                        stderr=log_file, start_new_session=True)
+            log_fd = os.open(os.path.join(RUNTIME, "session.log"),
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fd,
+                                        stderr=log_fd, start_new_session=True)
+            finally:
+                os.close(log_fd)
             threading.Thread(target=proc.wait, daemon=True).start()  # reap on exit
         except OSError as e:
             emit({"type": "error", "message": f"Could not start mpv: {e}"})
@@ -1100,7 +1383,7 @@ class Mpv:
             if proc.poll() is not None:
                 break
         proc.kill()  # never leave an unreachable player behind
-        emit({"type": "error", "message": "The sandboxed player could not start (needs mpv and bubblewrap)"})
+        emit({"type": "error", "message": "The sandboxed player could not start (needs mpv, bubblewrap and pw-cat)"})
         return False
 
     def _adopt(self, s):
@@ -1110,20 +1393,29 @@ class Mpv:
             self.command("observe_property", i, name)
 
     def _reader(self, s):
-        buf = b""
+        buf = bytearray()
         try:
             while True:
                 chunk = s.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                while True:
+                    end = buf.find(b"\n")
+                    if end < 0:
+                        if len(buf) > MAX_IPC_LINE:
+                            buf.clear()        # overlong line: drop it
+                        break
+                    line = bytes(buf[:end])
+                    del buf[:end + 1]
+                    if len(line) > MAX_IPC_LINE:
+                        continue
                     try:
                         msg = json.loads(line)
                     except ValueError:
                         continue
-                    self.on_event(msg)
+                    if isinstance(msg, dict):
+                        self.on_event(msg)
         except OSError:
             pass
         with self.lock:
@@ -1147,24 +1439,172 @@ class Mpv:
         self.command("quit")
 
 
+# ------------------------------------------------------------------ MPRIS
+#
+# Media keys and the omarchy.media widget talk MPRIS over D-Bus. The player
+# itself has no D-Bus access (it runs in the sandbox), so the daemon publishes
+# MPRIS here, outside it, and maps calls onto the same actions as the panel.
+# Requires python-gobject (part of Omarchy); without it only media-key
+# control is missing.
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.hertzradio"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_XML = """<node>
+ <interface name="org.mpris.MediaPlayer2">
+  <method name="Raise"/><method name="Quit"/>
+  <property name="CanQuit" type="b" access="read"/>
+  <property name="CanRaise" type="b" access="read"/>
+  <property name="HasTrackList" type="b" access="read"/>
+  <property name="Identity" type="s" access="read"/>
+  <property name="SupportedUriSchemes" type="as" access="read"/>
+  <property name="SupportedMimeTypes" type="as" access="read"/>
+ </interface>
+ <interface name="org.mpris.MediaPlayer2.Player">
+  <method name="Next"/><method name="Previous"/><method name="Pause"/>
+  <method name="PlayPause"/><method name="Stop"/><method name="Play"/>
+  <method name="Seek"><arg name="Offset" type="x" direction="in"/></method>
+  <method name="SetPosition"><arg name="TrackId" type="o" direction="in"/><arg name="Position" type="x" direction="in"/></method>
+  <method name="OpenUri"><arg name="Uri" type="s" direction="in"/></method>
+  <signal name="Seeked"><arg name="Position" type="x"/></signal>
+  <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="Rate" type="d" access="readwrite"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
+  <property name="Volume" type="d" access="readwrite"/>
+  <property name="Position" type="x" access="read"/>
+  <property name="MinimumRate" type="d" access="read"/>
+  <property name="MaximumRate" type="d" access="read"/>
+  <property name="CanGoNext" type="b" access="read"/>
+  <property name="CanGoPrevious" type="b" access="read"/>
+  <property name="CanPlay" type="b" access="read"/>
+  <property name="CanPause" type="b" access="read"/>
+  <property name="CanSeek" type="b" access="read"/>
+  <property name="CanControl" type="b" access="read"/>
+ </interface>
+</node>"""
+
+
+def split_title(title):
+    """'Artist - Song' -> (artist, song); otherwise ('', title)."""
+    parts = re.split(r"\s+[-–—]\s+", title or "", maxsplit=1)
+    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 and parts[0].strip() and parts[1].strip() else ("", (title or "").strip())
+
+
+class Mpris:
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.snapshot = {}
+        self.connection = None
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError) as e:
+            log("mpris: python-gobject unavailable, media keys disabled:", e)
+            self.GLib = None
+            return
+        self.Gio, self.GLib = Gio, GLib
+        self.node = Gio.DBusNodeInfo.new_for_xml(MPRIS_XML)
+        self.loop = GLib.MainLoop()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        self.Gio.bus_own_name(self.Gio.BusType.SESSION, MPRIS_NAME, self.Gio.BusNameOwnerFlags.NONE,
+                              self._on_bus, None, None)
+        self.loop.run()
+
+    def _on_bus(self, connection, _name):
+        self.connection = connection
+        register = getattr(connection, "register_object_with_closures2", None) or connection.register_object
+        for iface in self.node.interfaces:
+            register(MPRIS_PATH, iface, self._call, self._get, self._set)
+
+    # -- D-Bus handlers (GLib thread)
+
+    def _call(self, _conn, _sender, _path, iface, method, _params, invocation):
+        actions = {"Next": "next", "Previous": "prev", "Pause": "pause", "PlayPause": "toggle",
+                   "Stop": "stop", "Play": "play-resume"}
+        if method in actions:
+            self.daemon.handle(actions[method])
+        elif method == "OpenUri":
+            invocation.return_dbus_error("org.mpris.MediaPlayer2.Error.NotSupported",
+                                         "Hertz Radio only plays stations from its directory")
+            return
+        invocation.return_value(None)
+
+    def _get(self, _conn, _sender, _path, iface, prop):
+        return self._properties(iface).get(prop)
+
+    def _set(self, _conn, _sender, _path, iface, prop, value):
+        if prop == "Volume":
+            self.daemon.handle(f"volume {max(0.0, min(1.0, value.unpack())) * 100:.0f}")
+        return True
+
+    # -- state
+
+    def _properties(self, iface):
+        V = self.GLib.Variant
+        snap = self.snapshot
+        if iface == "org.mpris.MediaPlayer2":
+            return {"CanQuit": V("b", False), "CanRaise": V("b", False), "HasTrackList": V("b", False),
+                    "Identity": V("s", "Hertz Radio"), "SupportedUriSchemes": V("as", []),
+                    "SupportedMimeTypes": V("as", [])}
+        station = snap.get("station")
+        status = "Playing" if snap.get("playing") else "Paused" if snap.get("paused") else "Stopped"
+        metadata = {}
+        if station and status != "Stopped":
+            artist, song = split_title(snap.get("title", ""))
+            metadata = {
+                "mpris:trackid": V("o", "/io/github/pixdevsapps/HertzRadio/station/"
+                                   + station["uuid"].replace("-", "_")),
+                "xesam:title": V("s", song or station["name"]),
+                "xesam:album": V("s", station["name"]),
+            }
+            if artist:
+                metadata["xesam:artist"] = V("as", [artist])
+            if snap.get("art"):
+                metadata["mpris:artUrl"] = V("s", "file://" + urllib.parse.quote(snap["art"]))
+        return {"PlaybackStatus": V("s", status), "Rate": V("d", 1.0), "Metadata": V("a{sv}", metadata),
+                "Volume": V("d", snap.get("volume", 0) / 100.0), "Position": V("x", 0),
+                "MinimumRate": V("d", 1.0), "MaximumRate": V("d", 1.0),
+                "CanGoNext": V("b", bool(snap.get("hasNext"))), "CanGoPrevious": V("b", bool(snap.get("hasNext"))),
+                "CanPlay": V("b", bool(station)), "CanPause": V("b", bool(snap.get("playing"))),
+                "CanSeek": V("b", False), "CanControl": V("b", True)}
+
+    def update(self, snapshot):
+        if self.GLib is None:
+            return
+        self.GLib.idle_add(self._emit, snapshot)
+
+    def _emit(self, snapshot):
+        before = self._properties("org.mpris.MediaPlayer2.Player") if self.snapshot else {}
+        self.snapshot = snapshot
+        after = self._properties("org.mpris.MediaPlayer2.Player")
+        changed = {k: v for k, v in after.items() if k not in before or before[k] != v}
+        if changed and self.connection is not None:
+            self.connection.emit_signal(None, MPRIS_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                        self.GLib.Variant("(sa{sv}as)", ("org.mpris.MediaPlayer2.Player", changed, [])))
+        return False
+
+
 # ------------------------------------------------------------------ daemon
 
 
 class Daemon:
     def __init__(self):
         self.directory = Directory()
-        self.art = Artwork()
+        self.lock = threading.RLock()   # commands, mpv events and MPRIS calls take turns
+        self.art = Artwork(on_ready=self.on_art)
         self.mpv = Mpv(self.on_mpv)
         self.jobs = queue.Queue()
         self.generation = 0
         self.gen_lock = threading.Lock()
 
         saved = read_json(STATE_FILE, {})
-        self.favorites = [s for s in saved.get("favorites", []) if isinstance(s, dict) and s.get("uuid")]
+        self.favorites = clean_stations(saved.get("favorites"))
         self.volume = max(0, min(100, int(saved.get("volume", 70))))
         self.last_genre = str(saved.get("genre") or "All")
         self.last_country = saved.get("country") if valid_country(saved.get("country")) else ""
-        self.station = saved.get("last") if isinstance(saved.get("last"), dict) else None
+        self.station = clean_station(saved.get("last"))
 
         self.results = []       # current directory page(s) shown in the panel
         self.queue = []         # list the playing station was picked from
@@ -1185,6 +1625,7 @@ class Daemon:
 
         self.genres = read_json(os.path.join(HERE, "genres.json"), {"All": []})
         threading.Thread(target=self.worker, daemon=True).start()
+        self.mpris = Mpris(self)
 
     # ---- persistence
 
@@ -1199,9 +1640,14 @@ class Daemon:
 
     # ---- output
 
+    def on_art(self, uuid):
+        with self.lock:
+            if self.station and self.station["uuid"] == uuid:
+                self.publish()
+
     def publish(self):
         s = self.station
-        emit({
+        state = {
             "type": "state",
             "station": s,
             "playing": bool(s) and self.mode == "playing",
@@ -1215,7 +1661,9 @@ class Daemon:
             "favorite": bool(s) and any(f["uuid"] == s["uuid"] for f in self.favorites),
             "error": self.error,
             "hasNext": len(self.queue) > 1,
-        })
+        }
+        emit(state)
+        self.mpris.update(dict(state, art=self.art.path_for(s["uuid"]) if s else ""))
 
     def publish_favorites(self):
         emit({"type": "favorites", "items": self.favorites})
@@ -1224,6 +1672,10 @@ class Daemon:
     # ---- mpv events
 
     def on_mpv(self, msg):
+        with self.lock:
+            self._on_mpv(msg)
+
+    def _on_mpv(self, msg):
         ev = msg.get("event")
         if ev == "property-change":
             name, data = msg.get("name"), msg.get("data")
@@ -1292,7 +1744,10 @@ class Daemon:
         return None, None
 
     def play_station(self, station, source=None):
-        if not public_stream(station.get("url", "")):
+        station = clean_station(station)
+        if station is None:
+            return
+        if not public_stream(station["url"]):
             # Directory data is untrusted: never point the player at a local
             # or private-network address.
             self.station = station
@@ -1442,7 +1897,7 @@ class Daemon:
             self.art.request(items)
             return
         if page == 0:
-            cached = self.list_cache.get(key)
+            cached = clean_stations(self.list_cache.get(key))
             if cached:
                 emit({"type": "stations", "key": key, "page": 0, "items": cached, "more": True,
                       "genre": genre, "cached": True})
@@ -1479,6 +1934,10 @@ class Daemon:
     # ---- command loop
 
     def handle(self, line):
+        with self.lock:
+            self._handle(line)
+
+    def _handle(self, line):
         cmd, _, arg = line.strip().partition(" ")
         arg = arg.strip()
         if cmd == "search":
@@ -1495,6 +1954,9 @@ class Daemon:
             self.toggle()
         elif cmd == "pause":
             self.pause()
+        elif cmd == "play-resume":          # MPRIS Play: start unless already playing
+            if self.mode != "playing":
+                self.toggle()
         elif cmd in ("stop", "off"):
             self.stop()
         elif cmd == "next":
@@ -1548,10 +2010,11 @@ class Daemon:
         session = read_json(SESSION_FILE, {})
         mode = session.get("mode") or ("playing" if session.get("want") else "off")
         attached = self.mpv.attach()
-        if isinstance(session.get("station"), dict) and mode in ("playing", "paused"):
-            self.station = session["station"]
-            self.queue = [s for s in session.get("queue", []) if isinstance(s, dict)]
-            self.clicked = self.station.get("uuid")
+        restored = clean_station(session.get("station"))
+        if restored and mode in ("playing", "paused"):
+            self.station = restored
+            self.queue = clean_stations(session.get("queue"), limit=200)
+            self.clicked = restored["uuid"]
             self.mode = "playing" if mode == "playing" and attached else "paused" if mode == "paused" else "off"
         if attached and self.mode != "playing":
             self.mpv.quit()
@@ -1611,8 +2074,6 @@ def cli(argv):
         return 0
     if cmd == "player":
         return run_player(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 70)
-    if cmd == "sandbox-net" and len(argv) > 4 and argv[3] == "--":
-        return run_sandbox_net(argv[2], argv[4:])
     if cmd == "sandbox" and len(argv) > 4 and argv[3] == "--":
         return run_sandbox(argv[2], argv[4:])
     if cmd == "countries":
