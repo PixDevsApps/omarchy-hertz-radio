@@ -1,0 +1,11 @@
+{
+ "All": [], "Pop": ["pop"], "Rock": ["rock", "classic rock", "indie rock", "alternative rock", "hard rock", "progressive rock"],
+ "Metal": ["metal", "heavy metal", "death metal", "black metal", "power metal", "progressive metal"],
+ "Electronic": ["electronic", "electronica", "edm"], "Hip-Hop": ["hip hop", "hip-hop", "rap"],
+ "R&B": ["rnb", "r&b", "rhythm and blues"], "Funk": ["funk", "funk soul", "disco funk"], "Jazz": ["jazz", "smooth jazz"],
+ "Blues": ["blues"], "Classical": ["classical", "opera"], "Ambient": ["ambient", "atmospheric"],
+ "Alternative": ["alternative", "alternative rock"], "Country": ["country"], "Dance": ["dance"], "Disco": ["disco"],
+ "Drum & Bass": ["drum and bass", "drum & bass", "dnb"], "Folk": ["folk"], "House": ["house"], "Indie": ["indie", "indie rock"],
+ "Latin": ["latin", "latino"], "Lo-fi": ["lofi", "lo-fi"], "Reggae": ["reggae"], "Soul": ["soul"], "Techno": ["techno"],
+ "World": ["world", "world music"], "Talk": ["talk"], "News": ["news"], "Chill": ["chill", "chillout", "downtempo"]
+}

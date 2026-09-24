@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+"""hertz-ctl: backend for the Hertz Radio Omarchy bar plugin.
+
+`hertz-ctl daemon` runs for as long as the panel exists. It reads one-line
+commands on stdin and streams JSON lines on stdout, so the QML side never
+touches HTTP, files or the audio player itself:
+
+  in   search {"genre": "Jazz", "country": "DE", "text": "", "page": 0}
+       countries
+       play <uuid> | toggle | stop | next | prev | retry
+       volume <0-100> | mute | fav <uuid> | favorites
+  out  {"type": "state", ...}      player snapshot (station, title, volume, ...)
+       {"type": "stations", ...}   one page of directory results
+       {"type": "favorites", ...}  saved stations
+       {"type": "art", ...}        cached, local artwork path for a station
+       {"type": "genres", ...}     genre names for the chip strip
+       {"type": "countries", ...}  countries with station counts
+       {"type": "error", ...}      something the user should see
+
+Stations come from Radio Browser (https://www.radio-browser.info) through a
+discovered mirror with failover. Playback runs in mpv over its JSON IPC
+socket; mpv-mpris (part of Omarchy) publishes it to MPRIS, so media keys and
+the omarchy.media widget work too. mpv is started in its own session, so the
+stream survives a shell restart and the next daemon simply reattaches.
+
+Other entry points, handy for testing: `hertz-ctl search <text>`,
+`hertz-ctl genre <name>`, `hertz-ctl countries`, `hertz-ctl stop`.
+"""
+
+import hashlib
+import json
+import os
+import queue
+import random
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.0"
+USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "hertz-radio")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "hertz-radio")
+# Per-user runtime dir; never a predictable path in the shared /tmp.
+RUNTIME = (os.path.join(os.environ["XDG_RUNTIME_DIR"], "hertz-radio")
+           if os.environ.get("XDG_RUNTIME_DIR") else os.path.join(CACHE, "run"))
+ART_DIR = os.path.join(CACHE, "art")
+SOCKET = os.path.join(RUNTIME, "mpv.sock")
+SESSION_FILE = os.path.join(RUNTIME, "session.json")
+STATE_FILE = os.path.join(DATA, "state.json")
+LIST_CACHE = os.path.join(CACHE, "lists.json")
+
+PAGE = 40
+MERGE_CAP = 800   # merged (multi-query) results stop here; single queries page freely
+MAX_PAGE = 250    # 10,000 stations is plenty for a scroll list
+MAX_BODY = 4 * 1024 * 1024
+MAX_ART = 768 * 1024
+FALLBACK_MIRRORS = [
+    "https://de1.api.radio-browser.info",
+    "https://de2.api.radio-browser.info",
+    "https://fi1.api.radio-browser.info",
+    "https://nl1.api.radio-browser.info",
+]
+# Paused radio should not keep downloading. Pausing from the panel drops the
+# stream at once; a pause from media keys (MPRIS) keeps it this many seconds so
+# a quick resume is instant, then drops it too. Play always rejoins live.
+DISCONNECT_AFTER = 10.0
+# An idle player left behind by a pause is shut down after this long.
+IDLE_QUIT_AFTER = 300.0
+
+out_lock = threading.Lock()
+
+
+def emit(obj):
+    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    with out_lock:
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError):
+            os._exit(0)
+
+
+def log(*parts):
+    print("hertz-ctl:", *parts, file=sys.stderr, flush=True)
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_json(path, fallback):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, type(fallback)) else fallback
+    except (OSError, ValueError):
+        return fallback
+
+
+def http_url(value):
+    try:
+        u = urllib.parse.urlsplit(value or "")
+    except ValueError:
+        return False
+    return u.scheme in ("http", "https") and bool(u.hostname)
+
+
+def valid_country(value):
+    return isinstance(value, str) and len(value) == 2 and value.isascii() and value.isalpha() and value.isupper()
+
+
+COUNTRY_NAMES = {
+    "The United States Of America": "United States",
+    "The United Kingdom Of Great Britain And Northern Ireland": "United Kingdom",
+    "The Russian Federation": "Russia",
+    "The Republic Of Korea": "South Korea",
+    "The Democratic Peoples Republic Of Korea": "North Korea",
+    "Islamic Republic Of Iran": "Iran",
+    "Bolivarian Republic Of Venezuela": "Venezuela",
+    "Plurinational State Of Bolivia": "Bolivia",
+    "Taiwan, Republic Of China": "Taiwan",
+    "The Lao Peoples Democratic Republic": "Laos",
+    "Viet Nam": "Vietnam",
+    "Syrian Arab Republic": "Syria",
+    "The Republic Of Moldova": "Moldova",
+    "United Republic Of Tanzania": "Tanzania",
+    "Republic Of North Macedonia": "North Macedonia",
+    "Federated States Of Micronesia": "Micronesia",
+    "The Democratic Republic Of The Congo": "DR Congo",
+    "The Congo": "Republic of the Congo",
+    "The Holy See": "Vatican City",
+    "State Of Palestine": "Palestine",
+    "The Falkland Islands Malvinas": "Falkland Islands",
+    "The Cocos Keeling Islands": "Cocos (Keeling) Islands",
+}
+
+
+def country_name(raw):
+    """Radio Browser's ISO names, made readable: 'The Netherlands' -> 'Netherlands'."""
+    name = " ".join(str(raw or "").split())[:80]
+    if name in COUNTRY_NAMES:
+        return COUNTRY_NAMES[name]
+    if name.startswith("The "):
+        name = name[4:]
+    for word in (" Of ", " And ", " The "):
+        name = name.replace(word, word.lower())
+    return name
+
+
+def valid_uuid(value):
+    return bool(value) and len(value) <= 64 and all(c in "0123456789abcdefABCDEF-" for c in value)
+
+
+# ------------------------------------------------------------------ directory
+
+
+class Directory:
+    """Radio Browser client: mirror discovery, sticky failover, bounded reads."""
+
+    def __init__(self):
+        self.mirrors = []
+        self.active = 0
+        self.lock = threading.Lock()
+
+    def discover(self):
+        names = set()
+        try:
+            for info in socket.getaddrinfo("all.api.radio-browser.info", 443, proto=socket.IPPROTO_TCP):
+                try:
+                    host = socket.gethostbyaddr(info[4][0])[0]
+                except OSError:
+                    continue
+                if host.endswith(".api.radio-browser.info"):
+                    names.add("https://" + host)
+        except OSError:
+            pass
+        self.mirrors = sorted(names) or list(FALLBACK_MIRRORS)
+        self.active = random.randrange(len(self.mirrors))
+
+    def get(self, path, params=None):
+        with self.lock:
+            if not self.mirrors:
+                self.discover()
+            mirrors, start = list(self.mirrors), self.active
+        query = ("?" + urllib.parse.urlencode(params)) if params else ""
+        last = "Radio directory unavailable"
+        for n in range(len(mirrors)):
+            index = (start + n) % len(mirrors)
+            req = urllib.request.Request(mirrors[index] + path + query, headers={"User-Agent": USER_AGENT})
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    body = resp.read(MAX_BODY + 1)
+                if len(body) > MAX_BODY:
+                    raise ValueError("response too large")
+                data = json.loads(body)
+                with self.lock:
+                    self.active = index
+                return data
+            except (OSError, ValueError, urllib.error.URLError) as e:
+                last = str(getattr(e, "reason", e))
+        with self.lock:
+            self.mirrors = []  # rediscover next time
+        raise RuntimeError(last)
+
+    def search(self, tags, text, page, country="", genre=""):
+        """One page of stations for a genre (list of tags), country and/or free text.
+
+        Popular stations often carry dozens of tags, so a plain popularity sort
+        puts a big news or pop station at the top of "Jazz". Stations whose own
+        main genre is the selected one come first; popularity breaks ties."""
+        def rank(s):
+            return (bool(genre) and s["genre"] != genre, -s["clicks"])
+
+        limit = min((page + 1) * PAGE, MERGE_CAP)
+        requests = []
+        for tag in tags or [""]:
+            if text:
+                requests.append({"name": text, "tagList": tag} if tag else {"name": text})
+                if not tag:
+                    requests.append({"tag": text})
+            else:
+                requests.append({"tagList": tag} if tag else {})
+        base = {"hidebroken": "true", "order": "clickcount", "reverse": "true"}
+        if country:
+            base["countrycode"] = country
+
+        if len(requests) == 1:
+            # One query: page on the server, so scrolling never re-downloads
+            # earlier pages. One extra row tells us whether more exist.
+            params = dict(base, offset=str(page * PAGE), limit=str(PAGE + 1))
+            params.update({k: v for k, v in requests[0].items() if v})
+            rows = [s for s in map(slim, self.get("/json/stations/search", params)) if s]
+            return sorted(rows[:PAGE], key=rank), len(rows) > PAGE
+
+        # Several queries (multi-tag genres, name + tag search): merge them,
+        # de-duplicate and rank by popularity, up to MERGE_CAP stations.
+        stations, seen = [], set()
+        for extra in requests:
+            params = dict(base, limit=str(limit))
+            params.update({k: v for k, v in extra.items() if v})
+            for row in self.get("/json/stations/search", params):
+                s = slim(row)
+                if s and s["uuid"] not in seen:
+                    seen.add(s["uuid"])
+                    stations.append(s)
+        stations.sort(key=rank)
+        more = len(stations) > (page + 1) * PAGE or (len(stations) >= limit and limit < MERGE_CAP)
+        return stations[page * PAGE:(page + 1) * PAGE], more
+
+    def station(self, uuid):
+        if not valid_uuid(uuid):
+            return None
+        rows = self.get(f"/json/stations/byuuid/{uuid}")
+        return slim(rows[0]) if rows else None
+
+    def countries(self):
+        rows = self.get("/json/countries", {"hidebroken": "true"})
+        out = []
+        for c in rows if isinstance(rows, list) else []:
+            code = str(c.get("iso_3166_1") or "")
+            count = int(c.get("stationcount") or 0)
+            if valid_country(code) and count > 0:
+                out.append({"code": code, "name": country_name(c.get("name")), "count": count})
+        out.sort(key=lambda c: c["name"].lower())
+        return out
+
+    def click(self, uuid):
+        if valid_uuid(uuid):
+            try:
+                self.get(f"/json/url/{uuid}")
+            except RuntimeError:
+                pass
+
+
+GENRES = read_json(os.path.join(HERE, "genres.json"), {})
+GENRE_BY_TAG = {tag: name for name, tags in GENRES.items() for tag in tags}
+NOISE_TAGS = {"aac", "aac+", "mp3", "ogg", "opus", "flac", "hls", "radio", "fm", "am", "music",
+              "live", "internet", "internet radio", "webradio", "web radio", "free", "hd",
+              "stereo", "online", "station", "entertainment", "hits", "local", "public radio"}
+
+
+def genre_label(tags, country, places=()):
+    """The most meaningful tag: a known genre first, else the first real word
+    that is not a place or language (country, state, city) or format noise."""
+    lowered = [t.lower() for t in tags]
+    for t in lowered:
+        if t in GENRE_BY_TAG:
+            return GENRE_BY_TAG[t]
+    skip = {country.lower()} | {p.lower() for p in places if p}
+    for t in lowered:
+        if (t not in NOISE_TAGS and t not in skip and len(t) > 2 and not t[:1].isdigit()
+                and not t.endswith("kbps") and len(t) <= 24):
+            return t[:1].upper() + t[1:]
+    return ""
+
+
+def sane_bitrate(value):
+    try:
+        kbps = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if kbps > 4000:  # some stations report bits per second
+        kbps //= 1000
+    return kbps if 0 < kbps <= 4000 else 0
+
+
+def slim(row):
+    """Reduce a Radio Browser record to what the panel needs."""
+    if not isinstance(row, dict) or row.get("lastcheckok") not in (1, None):
+        return None
+    uuid = str(row.get("stationuuid") or "")
+    url = str(row.get("url_resolved") or row.get("url") or "")
+    if not valid_uuid(uuid) or not http_url(url):
+        return None
+    tags = [t.strip() for t in str(row.get("tags") or "").split(",") if t.strip()]
+    favicon = str(row.get("favicon") or "")
+    return {
+        "uuid": uuid,
+        "name": " ".join(str(row.get("name") or "Unnamed station").split())[:120],
+        "url": url,
+        "favicon": favicon if http_url(favicon) else "",
+        "homepage": str(row.get("homepage") or "")[:300],
+        "tags": tags[:4],
+        "genre": genre_label(tags, str(row.get("country") or ""),
+                             [str(row.get("state") or "")] + str(row.get("language") or "").split(",")),
+        "country": country_name(row.get("country"))[:60],
+        "countrycode": str(row.get("countrycode") or "")[:2].upper(),
+        "codec": str(row.get("codec") or "").upper()[:12],
+        "bitrate": sane_bitrate(row.get("bitrate")),
+        "hls": bool(row.get("hls")),
+        "clicks": int(row.get("clickcount") or 0),
+    }
+
+
+# ------------------------------------------------------------------ artwork
+
+
+class Artwork:
+    """Downloads station logos into the cache on a few worker threads."""
+
+    TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/gif": ".gif",
+             "image/webp": ".webp", "image/svg+xml": ".svg", "image/x-icon": ".ico",
+             "image/vnd.microsoft.icon": ".ico", "image/bmp": ".bmp"}
+
+    def __init__(self):
+        self.jobs = queue.Queue()
+        self.known = {}  # uuid -> path or "" (failed)
+        self.lock = threading.Lock()
+        os.makedirs(ART_DIR, exist_ok=True)
+        for _ in range(4):
+            threading.Thread(target=self.worker, daemon=True).start()
+
+    def request(self, stations):
+        for s in stations:
+            uuid, url = s.get("uuid"), s.get("favicon")
+            if not uuid or not url:
+                continue
+            with self.lock:
+                path = self.known.get(uuid)
+                if path is not None:
+                    if path:
+                        emit({"type": "art", "uuid": uuid, "path": path})
+                    continue
+                self.known[uuid] = ""
+            self.jobs.put((uuid, url))
+
+    def worker(self):
+        while True:
+            uuid, url = self.jobs.get()
+            path = self.fetch(uuid, url)
+            with self.lock:
+                self.known[uuid] = path or ""
+            if path:
+                emit({"type": "art", "uuid": uuid, "path": path})
+
+    def fetch(self, uuid, url):
+        key = hashlib.sha1(url.encode()).hexdigest()[:16]
+        for ext in set(self.TYPES.values()):
+            p = os.path.join(ART_DIR, f"{uuid}-{key}{ext}")
+            if os.path.exists(p):
+                return p
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                ctype = resp.headers.get_content_type().lower()
+                body = resp.read(MAX_ART + 1)
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        ext = self.TYPES.get(ctype) or self.sniff(body)
+        if not ext or len(body) > MAX_ART or len(body) < 16:
+            return None
+        path = os.path.join(ART_DIR, f"{uuid}-{key}{ext}")
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+        return path
+
+    @staticmethod
+    def sniff(body):
+        if body.startswith(b"\x89PNG"):
+            return ".png"
+        if body.startswith(b"\xff\xd8"):
+            return ".jpg"
+        if body[:6] in (b"GIF87a", b"GIF89a"):
+            return ".gif"
+        if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+            return ".webp"
+        if body[:4] == b"\x00\x00\x01\x00":
+            return ".ico"
+        if b"<svg" in body[:512].lower():
+            return ".svg"
+        return None
+
+
+# ------------------------------------------------------------------ mpv
+
+
+class Mpv:
+    """Minimal mpv JSON-IPC client. Events go to `on_event`."""
+
+    OBSERVED = ["pause", "core-idle", "paused-for-cache", "volume", "mute",
+                "metadata", "path", "audio-codec-name", "audio-params/samplerate"]
+
+    def __init__(self, on_event):
+        self.on_event = on_event
+        self.sock = None
+        self.lock = threading.Lock()
+        self.request_id = 0
+
+    @property
+    def alive(self):
+        return self.sock is not None
+
+    def attach(self):
+        """Reuse an mpv left running by a previous daemon, if any."""
+        if not os.path.exists(SOCKET):
+            return False
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(SOCKET)
+        except OSError:
+            try:
+                os.unlink(SOCKET)
+            except OSError:
+                pass
+            return False
+        self._adopt(s)
+        return True
+
+    def start(self, volume):
+        if self.alive or self.attach():
+            return True
+        os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+        cmd = ["mpv", "--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
+               f"--input-ipc-server={SOCKET}", f"--volume={volume}", "--volume-max=100",
+               "--cache=yes", "--cache-secs=20", "--demuxer-max-bytes=8MiB",
+               "--network-timeout=12", "--user-agent=" + USER_AGENT,
+               "--title=Hertz Radio", "--audio-client-name=hertz-radio",
+               "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5"]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            threading.Thread(target=proc.wait, daemon=True).start()  # reap on exit
+        except OSError as e:
+            emit({"type": "error", "message": f"Could not start mpv: {e}"})
+            return False
+        for _ in range(60):
+            time.sleep(0.05)
+            if self.attach():
+                return True
+        proc.kill()  # never leave an unreachable player behind
+        emit({"type": "error", "message": "mpv did not start"})
+        return False
+
+    def _adopt(self, s):
+        self.sock = s
+        threading.Thread(target=self._reader, args=(s,), daemon=True).start()
+        for i, name in enumerate(self.OBSERVED, 1):
+            self.command("observe_property", i, name)
+
+    def _reader(self, s):
+        buf = b""
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    self.on_event(msg)
+        except OSError:
+            pass
+        with self.lock:
+            if self.sock is s:
+                self.sock = None
+        self.on_event({"event": "hertz-disconnected"})
+
+    def command(self, *args):
+        with self.lock:
+            if not self.sock:
+                return False
+            self.request_id += 1
+            data = json.dumps({"command": list(args), "request_id": self.request_id}) + "\n"
+            try:
+                self.sock.sendall(data.encode())
+                return True
+            except OSError:
+                return False
+
+    def quit(self):
+        self.command("quit")
+
+
+# ------------------------------------------------------------------ daemon
+
+
+class Daemon:
+    def __init__(self):
+        self.directory = Directory()
+        self.art = Artwork()
+        self.mpv = Mpv(self.on_mpv)
+        self.jobs = queue.Queue()
+        self.generation = 0
+        self.gen_lock = threading.Lock()
+
+        saved = read_json(STATE_FILE, {})
+        self.favorites = [s for s in saved.get("favorites", []) if isinstance(s, dict) and s.get("uuid")]
+        self.volume = max(0, min(100, int(saved.get("volume", 70))))
+        self.last_genre = str(saved.get("genre") or "All")
+        self.last_country = saved.get("country") if valid_country(saved.get("country")) else ""
+        self.station = saved.get("last") if isinstance(saved.get("last"), dict) else None
+
+        self.results = []       # current directory page(s) shown in the panel
+        self.queue = []         # list the playing station was picked from
+        self.muted = False
+        # "off": no player, no network | "playing" | "paused": stream dropped
+        # (or, briefly after an MPRIS pause, held) with the station kept.
+        self.mode = "off"
+        self.pause_timer = None
+        self.idle = True
+        self.loaded = False     # a stream is open in mpv (and using the network)
+        self.buffering = False
+        self.title = ""
+        self.codec = ""
+        self.samplerate = 0
+        self.error = ""
+        self.clicked = None     # uuid already reported to Radio Browser
+        self.list_cache = read_json(LIST_CACHE, {})
+
+        self.genres = read_json(os.path.join(HERE, "genres.json"), {"All": []})
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    # ---- persistence
+
+    def save(self):
+        write_json(STATE_FILE, {"favorites": self.favorites, "volume": self.volume,
+                                "genre": self.last_genre, "country": self.last_country,
+                                "last": self.station})
+
+    def save_session(self):
+        write_json(SESSION_FILE, {"station": self.station, "queue": self.queue,
+                                  "mode": self.mode})
+
+    # ---- output
+
+    def publish(self):
+        s = self.station
+        emit({
+            "type": "state",
+            "station": s,
+            "playing": bool(s) and self.mode == "playing",
+            "paused": bool(s) and self.mode == "paused",
+            "buffering": self.mode == "playing" and (self.buffering or self.idle),
+            "title": self.title,
+            "codec": self.codec,
+            "samplerate": self.samplerate,
+            "volume": self.volume,
+            "muted": self.muted,
+            "favorite": bool(s) and any(f["uuid"] == s["uuid"] for f in self.favorites),
+            "error": self.error,
+            "hasNext": len(self.queue) > 1,
+        })
+
+    def publish_favorites(self):
+        emit({"type": "favorites", "items": self.favorites})
+        self.art.request(self.favorites)
+
+    # ---- mpv events
+
+    def on_mpv(self, msg):
+        ev = msg.get("event")
+        if ev == "property-change":
+            name, data = msg.get("name"), msg.get("data")
+            if name == "pause":
+                if data and self.mode == "playing":
+                    # Paused from outside (media keys): hold briefly, then disconnect.
+                    self.mode = "paused"
+                    self.schedule(DISCONNECT_AFTER, self.disconnect_if_paused)
+                    self.save_session()
+                elif not data and self.mode == "paused" and self.loaded:
+                    self.mode = "playing"          # resumed within the grace period
+                    self.cancel_timer()
+                    self.save_session()
+            elif name == "core-idle":
+                self.idle = bool(data)
+                if not self.idle and self.mode == "playing":
+                    self.error = ""
+                    self.report_click()
+            elif name == "path":
+                self.loaded = bool(data)
+            elif name == "paused-for-cache":
+                self.buffering = bool(data)
+            elif name == "volume" and data is not None:
+                self.volume = max(0, min(100, int(round(data))))
+            elif name == "mute":
+                self.muted = bool(data)
+            elif name == "metadata":
+                self.title = icy_title(data or {})
+            elif name == "audio-codec-name":
+                self.codec = str(data or "").upper()
+            elif name == "audio-params/samplerate":
+                self.samplerate = int(data or 0)
+            self.publish()
+        elif ev == "end-file":
+            reason = msg.get("reason")
+            if reason in ("error", "eof") and self.mode == "playing":
+                self.mode = "off"
+                self.error = friendly_error(msg.get("file_error") or reason)
+                self.save_session()
+                self.publish()
+        elif ev == "start-file":
+            self.title = ""
+            self.codec = ""
+            self.samplerate = 0
+            self.publish()
+        elif ev == "hertz-disconnected":
+            self.idle = True
+            self.loaded = False
+            if self.mode == "playing":
+                self.mode = "off"
+            self.publish()
+
+    def report_click(self):
+        s = self.station
+        if s and self.clicked != s["uuid"]:
+            self.clicked = s["uuid"]
+            self.jobs.put(("click", s["uuid"]))
+
+    # ---- playback
+
+    def find(self, uuid):
+        for source in (self.results, self.favorites, self.queue):
+            for s in source:
+                if s.get("uuid") == uuid:
+                    return s, source
+        return None, None
+
+    def play_station(self, station, source=None):
+        if not self.mpv.start(self.volume):
+            return
+        self.station = station
+        if source is None and not any(q["uuid"] == station["uuid"] for q in self.queue):
+            _, source = self.find(station["uuid"])
+        if source is not None:
+            self.queue = list(source)[:200]
+        self.title = ""
+        self.error = ""
+        self.mode = "playing"
+        self.cancel_timer()
+        self.clicked = None
+        self.mpv.command("set_property", "pause", False)
+        self.mpv.command("loadfile", station["url"], "replace", -1,
+                         {"force-media-title": station["name"]})
+        self.save()
+        self.save_session()
+        self.art.request([station])
+        self.publish()
+
+    def toggle(self):
+        if not self.station:
+            if self.results:
+                self.play_station(self.results[0], self.results)
+            return
+        if self.mode == "playing":
+            self.pause()
+        else:
+            self.play_station(self.station)   # always rejoin the live broadcast
+
+    def pause(self):
+        """Drop the stream but keep the station: no audio, no network."""
+        if self.mode != "playing" and not (self.mode == "paused" and self.loaded):
+            return
+        self.mode = "paused"
+        self.title = ""
+        self.mpv.command("stop")
+        self.schedule(IDLE_QUIT_AFTER, self.quit_if_paused)
+        self.save_session()
+        self.publish()
+
+    def disconnect_if_paused(self):
+        if self.mode == "paused" and self.loaded:
+            self.pause()
+
+    def quit_if_paused(self):
+        if self.mode == "paused":
+            self.mpv.quit()
+
+    def schedule(self, delay, fn):
+        self.cancel_timer()
+        self.pause_timer = threading.Timer(delay, fn)
+        self.pause_timer.daemon = True
+        self.pause_timer.start()
+
+    def cancel_timer(self):
+        if self.pause_timer:
+            self.pause_timer.cancel()
+            self.pause_timer = None
+
+    def step(self, delta):
+        if not self.queue:
+            return
+        index = next((i for i, s in enumerate(self.queue) if self.station and s["uuid"] == self.station["uuid"]), -1)
+        index = (index + delta) % len(self.queue)
+        self.play_station(self.queue[index])
+
+    def stop(self):
+        """Turn the radio off: shut the player down; the station stays selected."""
+        self.mode = "off"
+        self.cancel_timer()
+        self.error = ""
+        self.title = ""
+        self.mpv.quit()
+        self.save_session()
+        self.publish()
+
+    def set_volume(self, value):
+        self.volume = max(0, min(100, int(value)))
+        if self.mpv.alive:
+            self.mpv.command("set_property", "volume", self.volume)
+        self.save()
+        self.publish()
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.mpv.alive:
+            self.mpv.command("set_property", "mute", self.muted)
+        self.publish()
+
+    def toggle_favorite(self, uuid):
+        existing = [f for f in self.favorites if f["uuid"] == uuid]
+        if existing:
+            self.favorites = [f for f in self.favorites if f["uuid"] != uuid]
+        else:
+            station, _ = self.find(uuid)
+            if not station:
+                return
+            self.favorites.insert(0, station)
+        self.save()
+        self.publish_favorites()
+        self.publish()
+
+    # ---- directory (worker thread)
+
+    def request_search(self, spec):
+        with self.gen_lock:
+            self.generation += 1
+            gen = self.generation
+        self.jobs.put(("search", gen, spec))
+
+    def worker(self):
+        while True:
+            job = self.jobs.get()
+            try:
+                if job[0] == "search":
+                    self.run_search(*job[1:])
+                elif job[0] == "countries":
+                    self.run_countries()
+                elif job[0] == "click":
+                    self.directory.click(job[1])
+            except Exception as e:  # keep the worker alive whatever happens
+                log("worker:", repr(e))
+
+    def run_search(self, gen, spec):
+        genre = str(spec.get("genre") or "All")
+        text = " ".join(str(spec.get("text") or "").split())[:80]
+        page = max(0, min(int(spec.get("page") or 0), MAX_PAGE))
+        country = spec.get("country") if valid_country(spec.get("country")) else ""
+        key = f"{genre}|{country}|{text.lower()}"
+        if page == 0 and (genre, country) != (self.last_genre, self.last_country):
+            self.last_genre, self.last_country = genre, country
+            self.save()
+        if genre == "Favorites":
+            items = [s for s in self.favorites
+                     if (not text or text.lower() in s["name"].lower())
+                     and (not country or s.get("countrycode") == country)]
+            self.results = items
+            emit({"type": "stations", "key": key, "page": 0, "items": items, "more": False, "genre": genre})
+            self.art.request(items)
+            return
+        if page == 0:
+            cached = self.list_cache.get(key)
+            if cached:
+                emit({"type": "stations", "key": key, "page": 0, "items": cached, "more": True,
+                      "genre": genre, "cached": True})
+        emit({"type": "loading", "key": key, "page": page})
+        tags = self.genres.get(genre, [])
+        try:
+            items, more = self.directory.search(tags, text, page, country,
+                                                genre if genre not in ("All", "Favorites") else "")
+        except RuntimeError as e:
+            if gen == self.generation:
+                emit({"type": "stations-failed", "key": key, "page": page,
+                      "message": "Radio directory unreachable" + (" — showing saved results" if self.list_cache.get(key) else "")})
+            log("search failed:", e)
+            return
+        if gen != self.generation:
+            return  # superseded by a newer query
+        if page == 0:
+            self.results = items
+            self.list_cache[key] = items
+            lists = [k for k in self.list_cache if not k.startswith("__")]
+            if len(lists) > 40:
+                self.list_cache.pop(lists[0])
+            write_json(LIST_CACHE, self.list_cache)
+        else:
+            known = {s["uuid"] for s in self.results}
+            self.results = self.results + [s for s in items if s["uuid"] not in known]
+        emit({"type": "stations", "key": key, "page": page, "items": items, "more": more, "genre": genre})
+        self.art.request(items)
+        # A station resumed without its list (e.g. after a restart) adopts this one for next/prev.
+        if self.station and not self.queue and any(i["uuid"] == self.station["uuid"] for i in self.results):
+            self.queue = list(self.results)
+            self.publish()
+
+    # ---- command loop
+
+    def handle(self, line):
+        cmd, _, arg = line.strip().partition(" ")
+        arg = arg.strip()
+        if cmd == "search":
+            try:
+                spec = json.loads(arg) if arg else {}
+            except ValueError:
+                spec = {"text": arg}
+            self.request_search(spec if isinstance(spec, dict) else {})
+        elif cmd == "play":
+            station, source = self.find(arg)
+            if station:
+                self.play_station(station, source)
+        elif cmd == "toggle":
+            self.toggle()
+        elif cmd == "pause":
+            self.pause()
+        elif cmd in ("stop", "off"):
+            self.stop()
+        elif cmd == "next":
+            self.step(1)
+        elif cmd == "prev":
+            self.step(-1)
+        elif cmd == "retry":
+            if self.station:
+                self.play_station(self.station)
+        elif cmd == "volume":
+            try:
+                self.set_volume(float(arg))
+            except ValueError:
+                pass
+        elif cmd == "mute":
+            self.toggle_mute()
+        elif cmd == "fav":
+            self.toggle_favorite(arg)
+        elif cmd == "countries":
+            self.jobs.put(("countries",))
+        elif cmd == "favorites":
+            self.publish_favorites()
+        elif cmd == "hello":
+            self.hello()
+
+    def run_countries(self):
+        cached = self.list_cache.get("__countries__")
+        if cached:
+            emit({"type": "countries", "items": cached, "cached": True})
+        try:
+            items = self.directory.countries()
+        except RuntimeError as e:
+            log("countries failed:", e)
+            return
+        if items:
+            self.list_cache["__countries__"] = items
+            write_json(LIST_CACHE, self.list_cache)
+            emit({"type": "countries", "items": items})
+
+    def hello(self):
+        emit({"type": "genres", "items": [g for g in self.genres.keys()],
+              "current": self.last_genre, "country": self.last_country})
+        self.publish_favorites()
+        self.publish()
+        if self.station:
+            self.art.request([self.station])
+
+    def run(self):
+        # Reattach to a stream a previous daemon (e.g. before a shell restart)
+        # left playing. A paused session comes back paused, without a player.
+        session = read_json(SESSION_FILE, {})
+        mode = session.get("mode") or ("playing" if session.get("want") else "off")
+        attached = self.mpv.attach()
+        if isinstance(session.get("station"), dict) and mode in ("playing", "paused"):
+            self.station = session["station"]
+            self.queue = [s for s in session.get("queue", []) if isinstance(s, dict)]
+            self.clicked = self.station.get("uuid")
+            self.mode = "playing" if mode == "playing" and attached else "paused" if mode == "paused" else "off"
+        if attached and self.mode != "playing":
+            self.mpv.quit()
+        self.hello()
+        for line in sys.stdin:
+            if line.strip():
+                try:
+                    self.handle(line)
+                except Exception as e:
+                    log("command failed:", line.strip(), repr(e))
+        # Panel went away. Keep a playing stream alive for the next daemon;
+        # an idle player has no reason to linger.
+        if self.mode != "playing":
+            self.mpv.quit()
+
+
+def icy_title(meta):
+    lowered = {str(k).lower(): v for k, v in meta.items()}
+    title = lowered.get("icy-title") or ""
+    if not title and lowered.get("title"):
+        artist = lowered.get("artist")
+        title = f"{artist} – {lowered['title']}" if artist else lowered["title"]
+    title = " ".join(str(title).split())
+    return "" if title in ("-", " - ") else title[:200]
+
+
+def friendly_error(raw):
+    raw = str(raw or "").lower()
+    if "unrecognized" in raw or "format" in raw:
+        return "Unsupported stream format"
+    if "loading" in raw or "open" in raw:
+        return "Station is not responding"
+    if raw == "eof":
+        return "Stream ended"
+    return "Station unavailable"
+
+
+# ------------------------------------------------------------------ cli
+
+
+def cli(argv):
+    if len(argv) < 2 or argv[1] == "daemon":
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        Daemon().run()
+        return 0
+    cmd = argv[1]
+    if cmd in ("search", "genre"):
+        d = Directory()
+        genres = read_json(os.path.join(HERE, "genres.json"), {})
+        text = " ".join(argv[2:])
+        tags, query = (genres.get(text, [text.lower()]), "") if cmd == "genre" else ([], text)
+        items, more = d.search(tags, query, 0)
+        for s in items:
+            print(f"{s['uuid']}  {s['codec']:>5} {s['bitrate']:>4}k  {s['name']}  [{s['country']}]")
+        print(f"-- {len(items)} stations{' (more)' if more else ''} via {d.mirrors[d.active]}", file=sys.stderr)
+        return 0
+    if cmd == "countries":
+        for c in Directory().countries():
+            print(f"{c['code']}  {c['count']:>6}  {c['name']}")
+        return 0
+    if cmd == "stop":
+        m = Mpv(lambda _msg: None)
+        if m.attach():
+            m.quit()
+        return 0
+    if cmd in ("-v", "--version", "version"):
+        print(VERSION)
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv))
