@@ -139,6 +139,25 @@ Panel.qml ──stdin: search / play / toggle / fav / volume …──▶ hertz-
 - `mpv` runs in its own session. When the shell restarts, the new daemon
   reattaches to the running stream. An idle player is shut down.
 
+### Network safety
+
+Station records come from a public, community-edited directory, so their
+logo and stream URLs are treated as untrusted. Every request `hertz-ctl`
+makes goes through one guard:
+
+- The host is resolved first, and **every** address must be on the public
+  internet. Loopback, private, link-local (including `169.254.169.254`),
+  carrier-grade NAT, multicast, reserved and IPv4-mapped forms are refused.
+  The connection then goes to exactly the checked address, so a DNS answer
+  can't be swapped for a local one.
+- Every redirect hop is checked the same way (at most 3, http/https only).
+- Logos may only use ports 80 and 443. No proxy, FTP or `file:` handlers.
+- Before a stream is handed to `mpv` (only when you press play), its host
+  gets the same public-address check.
+
+`python3 -m unittest discover -s tests -v` runs the guard's tests, including
+local servers that must receive no request at all.
+
 ## Files it writes
 
 | Path | Contents |

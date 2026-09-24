@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 — 2026-09-24
+
+- Security: station logo and stream URLs from the directory can no longer
+  reach local or private-network addresses. All requests resolve the host,
+  require every address to be public, connect to that exact address, check
+  each redirect hop (at most 3), and logos are limited to ports 80 and 443.
+  Streams get the same check before playback. Reported in marketplace review.
+- A download error can no longer stop the artwork worker threads.
+- Tests for the network guard in `tests/`.
+
 ## 1.0.0 — 2026-09-24
 
 First public release.
