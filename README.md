@@ -69,8 +69,9 @@ omarchy bar move io.github.pixdevsapps.hertz-radio --section center
 omarchy bar move io.github.pixdevsapps.hertz-radio --before omarchy.audio
 ```
 
-Requirements: `python` (standard library only), `mpv` and `mpv-mpris`. All
-three ship with Omarchy.
+Requirements: `python` (standard library only), `mpv`, `mpv-mpris`,
+`bubblewrap` and `iproute2`. All of them ship with Omarchy. Playback needs
+unprivileged user namespaces (the Arch default), which the player sandbox uses.
 
 ## Using it
 
@@ -139,24 +140,24 @@ Panel.qml ──stdin: search / play / toggle / fav / volume …──▶ hertz-
 - `mpv` runs in its own session. When the shell restarts, the new daemon
   reattaches to the running stream. An idle player is shut down.
 
-### Network safety
+### Security
 
-Station records come from a public, community-edited directory, so their
-logo and stream URLs are treated as untrusted. Every request `hertz-ctl`
-makes goes through one guard:
+Station data comes from a public, community-edited directory, so station
+names, logo and stream URLs, and whatever a stream sends back are treated as
+untrusted:
 
-- The host is resolved first, and **every** address must be on the public
-  internet. Loopback, private, link-local (including `169.254.169.254`),
-  carrier-grade NAT, multicast, reserved and IPv4-mapped forms are refused.
-  The connection then goes to exactly the checked address, so a DNS answer
-  can't be swapped for a local one.
-- Every redirect hop is checked the same way (at most 3, http/https only).
-- Logos may only use ports 80 and 443. No proxy, FTP or `file:` handlers.
-- Before a stream is handed to `mpv` (only when you press play), its host
-  gets the same public-address check.
+- **Logos and the directory API** are fetched only from public internet
+  addresses. Every resolved address is checked, the connection goes to exactly
+  that address, redirect hops are re-checked, and logos must be PNG, JPEG, GIF,
+  WebP, ICO or BMP.
+- **The player (mpv) runs in a sandbox with no network of its own.** Its only
+  way out is a small proxy that applies the same public-address check to every
+  request, so redirects, playlists and HLS segments can't reach `localhost`,
+  your LAN or cloud metadata addresses. Stream TLS certificates are verified.
+- Names and titles are shown as plain text, and no shell is ever used.
 
-`python3 -m unittest discover -s tests -v` runs the guard's tests, including
-local servers that must receive no request at all.
+The details, threat model and tests are in [SECURITY.md](SECURITY.md).
+`python3 -m unittest discover -s tests -v` runs the tests.
 
 ## Files it writes
 

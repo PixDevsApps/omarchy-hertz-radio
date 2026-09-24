@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.pixdevsapps.hertz-radio",
   "name": "Hertz Radio",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "author": "Fredrick Thorsen",
   "license": "MIT",
   "description": "Internet radio in the bar: a minimalist player with genre, country and search browsing, favorites, and station artwork tinted in your theme's colors. Stations from radio-browser.info.",

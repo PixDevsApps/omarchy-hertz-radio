@@ -27,6 +27,8 @@ Other entry points, handy for testing: `hertz-ctl search <text>`,
 `hertz-ctl genre <name>`, `hertz-ctl countries`, `hertz-ctl stop`.
 """
 
+import errno
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -34,8 +36,13 @@ import json
 import os
 import queue
 import random
+import select
+import shutil
 import signal
 import socket
+import socketserver
+import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -43,7 +50,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
 HERE = os.path.dirname(os.path.realpath(__file__))
 
@@ -128,31 +135,97 @@ class BlockedAddress(OSError):
     """Raised instead of connecting to a non-public address."""
 
 
+NAT64 = ipaddress.ip_network("64:ff9b::/96")
+IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+MAX_ENDPOINTS = 16
+
+
+def _public(ip):
+    return ip.is_global and not (ip.is_multicast or ip.is_unspecified or ip.is_reserved
+                                 or getattr(ip, "is_site_local", False))
+
+
 def public_ip(address):
+    """True only for globally routable unicast addresses. IPv6 forms that
+    carry an IPv4 address (mapped, 6to4, Teredo, NAT64, IPv4-compatible)
+    must carry a public one."""
     try:
         ip = ipaddress.ip_address(str(address).split("%", 1)[0])
     except ValueError:
         return False
-    if ip.version == 6 and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return ip.is_global and not ip.is_multicast
+    if ip.version == 6:
+        embedded = []
+        if ip.ipv4_mapped:
+            embedded.append(ip.ipv4_mapped)
+        if ip.sixtofour:
+            embedded.append(ip.sixtofour)
+        if ip.teredo:
+            embedded.extend(ip.teredo)
+        if ip in NAT64 or ip in IPV4_COMPATIBLE:
+            embedded.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+        if any(not _public(v4) for v4 in embedded):
+            return False
+        if ip.ipv4_mapped:
+            return True
+    return _public(ip)
+
+
+_route_cache = {}
+_route_lock = threading.Lock()
+
+
+def routes_to_this_machine(address):
+    """True if the kernel would deliver this address locally (e.g. one of this
+    machine's own public IPs). Fails closed if the route can't be checked."""
+    now = time.monotonic()
+    with _route_lock:
+        hit = _route_cache.get(address)
+        if hit and now - hit[1] < 60:
+            return hit[0]
+    try:
+        out = subprocess.run(["ip", "-j", "route", "get", address], capture_output=True,
+                             stdin=subprocess.DEVNULL, timeout=2, check=False)
+        routes = json.loads(out.stdout) if out.returncode == 0 else None
+        local = not isinstance(routes, list) or any(
+            isinstance(r, dict) and (r.get("type") == "local" or r.get("dev") == "lo") for r in routes)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        local = True
+    with _route_lock:
+        if len(_route_cache) > 512:
+            _route_cache.clear()
+        _route_cache[address] = (local, now)
+    return local
 
 
 def resolve_public(host, port):
     """All addresses for host:port, or BlockedAddress if any is non-public."""
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror as e:
+    except (socket.gaierror, UnicodeError) as e:
         raise OSError(f"cannot resolve {host}") from e
-    if not infos or not all(public_ip(info[4][0]) for info in infos):
-        raise BlockedAddress(f"{host} is not a public internet address")
+    if not infos or len(infos) > MAX_ENDPOINTS * 3:
+        raise BlockedAddress(f"{host} did not resolve to a usable address")
+    for info in infos:
+        address = info[4][0].split("%", 1)[0]
+        if not public_ip(address) or routes_to_this_machine(address):
+            raise BlockedAddress(f"{host} is not a public internet address")
     return infos
+
+
+# Ports browsers refuse for HTTP (WHATWG Fetch "bad ports"), so a station
+# can't make the player speak HTTP to mail, SSH, DNS or similar services.
+BAD_PORTS = frozenset([0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53,
+                       69, 77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117,
+                       119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514,
+                       515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989,
+                       990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061,
+                       6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080])
 
 
 def public_connection(ports):
     def create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **_):
         host, port = address[0], int(address[1])
-        if ports and port not in ports:
+        if (ports and port not in ports) or port in BAD_PORTS or not 0 < port < 65536:
             raise BlockedAddress(f"port {port} is not allowed")
         last = None
         for family, kind, proto, _name, sockaddr in resolve_public(host, port):
@@ -215,6 +288,288 @@ def public_stream(url):
         return True
     except (OSError, ValueError):
         return False
+
+
+# ------------------------------------------------------------------ player sandbox
+#
+# mpv resolves names, follows redirects and expands playlists / HLS segment
+# lists on its own, so checking a stream URL up front is not enough. The
+# player therefore runs in a bubblewrap sandbox with its own, empty network
+# namespace. Its only way out is this proxy (outside the sandbox, on a Unix
+# socket in the private runtime dir), which applies the same public-address
+# policy to every request: each redirect, playlist entry and segment arrives
+# here as a new request. Direct TCP/UDP/RTSP or DNS from inside has no route.
+
+PROXY_MAX_HEADER = 65536
+PROXY_MAX_CONNECTIONS = 32
+PROXY_IDLE_TIMEOUT = 90
+
+
+class ProxyRefused(Exception):
+    def __init__(self, status):
+        super().__init__(status)
+        self.status = status
+
+
+def _read_header(conn):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(16384)
+        if not chunk:
+            raise ProxyRefused(b"400 Bad Request")
+        data.extend(chunk)
+        if len(data) > PROXY_MAX_HEADER:
+            raise ProxyRefused(b"431 Request Header Fields Too Large")
+    end = data.index(b"\r\n\r\n") + 4
+    return bytes(data[:end]), bytes(data[end:])
+
+
+def _parse_proxy_request(header):
+    lines = header[:-4].split(b"\r\n")
+    try:
+        method, target, version = lines[0].decode("ascii").split(" ")
+    except (UnicodeDecodeError, ValueError):
+        raise ProxyRefused(b"400 Bad Request")
+    if version not in ("HTTP/1.0", "HTTP/1.1"):
+        raise ProxyRefused(b"400 Bad Request")
+    kept = []
+    for line in lines[1:]:
+        if not line or line[:1].isspace() or b":" not in line:
+            raise ProxyRefused(b"400 Bad Request")
+        name = line.split(b":", 1)[0].strip().lower()
+        if name not in (b"host", b"connection", b"proxy-connection", b"proxy-authorization", b"keep-alive"):
+            kept.append(line)
+    if method == "CONNECT":
+        u = urllib.parse.urlsplit("//" + target)
+        try:
+            port = u.port or 443
+        except ValueError:
+            raise ProxyRefused(b"400 Bad Request")
+        if not u.hostname or u.username is not None or u.path or u.query:
+            raise ProxyRefused(b"400 Bad Request")
+        return method, u.hostname, port, b""
+    if method not in ("GET", "HEAD"):
+        raise ProxyRefused(b"405 Method Not Allowed")
+    u = urllib.parse.urlsplit(target)
+    try:
+        port = u.port or 80
+    except ValueError:
+        raise ProxyRefused(b"400 Bad Request")
+    if u.scheme.lower() != "http" or not u.hostname or u.username is not None or u.password is not None:
+        raise ProxyRefused(b"400 Bad Request")
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    try:
+        head = [f"{method} {path} {version}".encode("ascii"), *kept,
+                b"Host: " + u.netloc.encode("ascii"), b"Connection: close", b"", b""]
+    except UnicodeEncodeError:
+        raise ProxyRefused(b"400 Bad Request")
+    return method, u.hostname, port, b"\r\n".join(head)
+
+
+def _relay(a, b):
+    a.settimeout(None)
+    b.settimeout(None)
+    while True:
+        ready, _, _ = select.select((a, b), (), (), PROXY_IDLE_TIMEOUT)
+        if not ready:
+            return
+        for src in ready:
+            data = src.recv(65536)
+            if not data:
+                return
+            (b if src is a else a).sendall(data)
+
+
+class _ProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client = self.request
+        client.settimeout(15)
+        try:
+            header, pending = _read_header(client)
+            method, host, port, forward = _parse_proxy_request(header)
+            try:
+                upstream = public_connection(None)((host, port), timeout=15)
+            except BlockedAddress:
+                raise ProxyRefused(b"403 Forbidden")
+            except OSError:
+                raise ProxyRefused(b"502 Bad Gateway")
+            with upstream:
+                if method == "CONNECT":
+                    client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                else:
+                    upstream.sendall(forward)
+                if pending:
+                    upstream.sendall(pending)
+                _relay(client, upstream)
+        except ProxyRefused as e:
+            try:
+                client.sendall(b"HTTP/1.1 " + e.status + b"\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+
+class _LimitedServer:
+    daemon_threads = True
+    request_queue_size = PROXY_MAX_CONNECTIONS
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(PROXY_MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+class GuardedProxy(_LimitedServer, socketserver.ThreadingUnixStreamServer):
+    """HTTP (absolute-form GET/HEAD) and HTTPS (CONNECT) proxy that only
+    reaches public internet addresses."""
+
+    def __init__(self, path):
+        super().__init__(path, _ProxyHandler)
+
+
+class _BridgeHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as up:
+                up.connect(self.server.proxy_path)
+                _relay(self.request, up)
+        except OSError:
+            pass
+
+
+class _Bridge(_LimitedServer, socketserver.ThreadingTCPServer):
+    """Inside the sandbox: 127.0.0.1:<port> -> the proxy's Unix socket."""
+    allow_reuse_address = True
+
+    def __init__(self, proxy_path):
+        self.proxy_path = proxy_path
+        super().__init__(("127.0.0.1", 0), _BridgeHandler)
+
+
+def mpv_arguments(volume):
+    return ["mpv", "--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
+            f"--input-ipc-server={SOCKET}", f"--volume={volume}", "--volume-max=100",
+            "--cache=yes", "--cache-secs=20", "--demuxer-max-bytes=8MiB",
+            "--network-timeout=12", "--user-agent=" + USER_AGENT,
+            "--title=Hertz Radio", "--audio-client-name=hertz-radio",
+            "--ytdl=no", "--load-unsafe-playlists=no", "--tls-verify=yes",
+            "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5"]
+
+
+def run_player(volume):
+    """`hertz-ctl player`: guarded proxy + sandboxed mpv, for as long as mpv runs."""
+    os.umask(0o077)
+    private_dir(RUNTIME)
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        log("player: bubblewrap (bwrap) is required to sandbox playback")
+        return 3
+    proxy_path = os.path.join(RUNTIME, "proxy.sock")
+    if os.path.lexists(proxy_path):
+        if not stat.S_ISSOCK(os.lstat(proxy_path).st_mode):
+            log("player: proxy path exists and is not a socket")
+            return 3
+        os.unlink(proxy_path)
+    proxy = GuardedProxy(proxy_path)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    # bubblewrap: read-only filesystem except the private runtime dir, a
+    # minimal /dev, own PID namespace, dies with this session. The network
+    # namespace is set up by `sandbox-net` below.
+    cmd = [bwrap, "--unshare-pid", "--die-with-parent", "--new-session",
+           "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+           "--bind", RUNTIME, RUNTIME,
+           "--", sys.executable, os.path.realpath(__file__), "sandbox-net", proxy_path, "--",
+           *mpv_arguments(volume)]
+    try:
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL).returncode
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        try:
+            os.unlink(proxy_path)
+        except OSError:
+            pass
+
+
+def run_sandbox_net(proxy_path, mpv_cmd):
+    """`hertz-ctl sandbox-net`: enter a new user + network namespace that holds
+    only a loopback interface, then re-exec as `sandbox`. The re-exec runs as
+    the normal (non-root) user, so the kernel clears every capability."""
+    uid, gid = os.getuid(), os.getgid()
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET)
+    with open("/proc/self/setgroups", "w") as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", "w") as f:
+        f.write(f"{uid} {uid} 1")
+    with open("/proc/self/gid_map", "w") as f:
+        f.write(f"{gid} {gid} 1")
+    siocgifflags, siocsifflags, iff_up = 0x8913, 0x8914, 0x1
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        ifr = struct.pack("16sh14x", b"lo", 0)
+        flags = struct.unpack("16sh14x", fcntl.ioctl(s, siocgifflags, ifr))[1]
+        fcntl.ioctl(s, siocsifflags, struct.pack("16sh14x", b"lo", flags | iff_up))
+    script = os.path.realpath(__file__)
+    os.execv(sys.executable, [sys.executable, script, "sandbox", proxy_path, "--", *mpv_cmd])
+
+
+def sandbox_is_sealed():
+    """Refuse to run the player unless it has no capabilities and no route out."""
+    with open("/proc/self/status") as f:
+        caps = {k: v.strip() for k, v in (line.split(":", 1) for line in f if line.startswith("Cap"))}
+    if any(int(caps.get(k, "0"), 16) for k in ("CapEff", "CapPrm", "CapAmb")):
+        return False
+    for family, address in ((socket.AF_INET, ("1.1.1.1", 443)), (socket.AF_INET6, ("2606:4700:4700::1111", 443))):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(address)
+            return False
+        except OSError as e:
+            if e.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
+                return False
+    return True
+
+
+def run_sandbox(proxy_path, mpv_cmd):
+    """`hertz-ctl sandbox` (inside the namespaces): start the bridge, run mpv through it."""
+    if not sandbox_is_sealed():
+        log("sandbox: isolation check failed; refusing to start the player")
+        return 4
+    bridge = _Bridge(proxy_path)
+    threading.Thread(target=bridge.serve_forever, daemon=True).start()
+    proxy_url = f"http://127.0.0.1:{bridge.server_address[1]}"
+    env = dict(os.environ, http_proxy=proxy_url, https_proxy=proxy_url,
+               HTTP_PROXY=proxy_url, HTTPS_PROXY=proxy_url, no_proxy="", NO_PROXY="")
+    return subprocess.run([*mpv_cmd, f"--http-proxy={proxy_url}"], env=env,
+                          stdin=subprocess.DEVNULL).returncode
+
+
+def private_dir(path):
+    """Create (if needed) and return a directory only this user can use.
+    Refuses symlinks and directories owned by someone else."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PermissionError(f"{path} is not a private directory")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+    return path
 
 
 def http_url(value):
@@ -459,7 +814,7 @@ class Artwork:
     """Downloads station logos into the cache on a few worker threads."""
 
     TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/gif": ".gif",
-             "image/webp": ".webp", "image/svg+xml": ".svg", "image/x-icon": ".ico",
+             "image/webp": ".webp", "image/x-icon": ".ico",
              "image/vnd.microsoft.icon": ".ico", "image/bmp": ".bmp"}
 
     def __init__(self):
@@ -467,8 +822,38 @@ class Artwork:
         self.known = {}  # uuid -> path or "" (failed)
         self.lock = threading.Lock()
         os.makedirs(ART_DIR, exist_ok=True)
+        threading.Thread(target=self.prune, daemon=True).start()
         for _ in range(4):
             threading.Thread(target=self.worker, daemon=True).start()
+
+    ART_MAX_FILES = 3000
+    ART_MAX_BYTES = 150 * 1024 * 1024
+
+    def prune(self):
+        """Keep the logo cache bounded: drop the least recently used files."""
+        try:
+            entries = []
+            for e in os.scandir(ART_DIR):
+                if e.name.endswith(".svg"):      # no longer displayed (see sniff)
+                    os.unlink(e.path)
+                    continue
+                if e.is_file(follow_symlinks=False):
+                    st = e.stat(follow_symlinks=False)
+                    entries.append((st.st_atime, st.st_size, e.path))
+        except OSError:
+            return
+        entries.sort()
+        count, total = len(entries), sum(e[1] for e in entries)
+        for _atime, size, path in entries:
+            if count <= self.ART_MAX_FILES * 3 // 4 and total <= self.ART_MAX_BYTES * 3 // 4:
+                break
+            if count <= self.ART_MAX_FILES and total <= self.ART_MAX_BYTES and count == len(entries):
+                break
+            try:
+                os.unlink(path)
+                count, total = count - 1, total - size
+            except OSError:
+                pass
 
     def request(self, stations):
         for s in stations:
@@ -510,7 +895,7 @@ class Artwork:
                 body = resp.read(MAX_ART + 1)
         except (OSError, ValueError, http.client.HTTPException):
             return None
-        ext = self.TYPES.get(ctype) or self.sniff(body)
+        ext = self.sniff(body)   # trust the bytes, not the server's Content-Type
         if not ext or len(body) > MAX_ART or len(body) < 16:
             return None
         path = os.path.join(ART_DIR, f"{uuid}-{key}{ext}")
@@ -532,9 +917,9 @@ class Artwork:
             return ".webp"
         if body[:4] == b"\x00\x00\x01\x00":
             return ".ico"
-        if b"<svg" in body[:512].lower():
-            return ".svg"
-        return None
+        if body[:2] == b"BM":
+            return ".bmp"
+        return None  # SVG and anything unrecognised is not shown
 
 
 # ------------------------------------------------------------------ mpv
@@ -575,26 +960,29 @@ class Mpv:
     def start(self, volume):
         if self.alive or self.attach():
             return True
-        os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
-        cmd = ["mpv", "--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
-               f"--input-ipc-server={SOCKET}", f"--volume={volume}", "--volume-max=100",
-               "--cache=yes", "--cache-secs=20", "--demuxer-max-bytes=8MiB",
-               "--network-timeout=12", "--user-agent=" + USER_AGENT,
-               "--title=Hertz Radio", "--audio-client-name=hertz-radio",
-               "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5"]
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            private_dir(RUNTIME)
+        except OSError as e:
+            emit({"type": "error", "message": f"Runtime folder is not private: {e}"})
+            return False
+        # Sandboxed player session: see run_player().
+        cmd = [sys.executable, os.path.realpath(__file__), "player", str(volume)]
+        try:
+            with open(os.path.join(RUNTIME, "player.log"), "ab") as log_file:
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_file,
+                                        stderr=log_file, start_new_session=True)
             threading.Thread(target=proc.wait, daemon=True).start()  # reap on exit
         except OSError as e:
             emit({"type": "error", "message": f"Could not start mpv: {e}"})
             return False
-        for _ in range(60):
+        for _ in range(160):
             time.sleep(0.05)
             if self.attach():
                 return True
+            if proc.poll() is not None:
+                break
         proc.kill()  # never leave an unreachable player behind
-        emit({"type": "error", "message": "mpv did not start"})
+        emit({"type": "error", "message": "The sandboxed player could not start (needs mpv and bubblewrap)"})
         return False
 
     def _adopt(self, s):
@@ -1087,6 +1475,7 @@ def friendly_error(raw):
 
 
 def cli(argv):
+    os.umask(0o077)  # state, cache and sockets are private to this user
     if len(argv) < 2 or argv[1] == "daemon":
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         Daemon().run()
@@ -1102,6 +1491,12 @@ def cli(argv):
             print(f"{s['uuid']}  {s['codec']:>5} {s['bitrate']:>4}k  {s['name']}  [{s['country']}]")
         print(f"-- {len(items)} stations{' (more)' if more else ''} via {d.mirrors[d.active]}", file=sys.stderr)
         return 0
+    if cmd == "player":
+        return run_player(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 70)
+    if cmd == "sandbox-net" and len(argv) > 4 and argv[3] == "--":
+        return run_sandbox_net(argv[2], argv[4:])
+    if cmd == "sandbox" and len(argv) > 4 and argv[3] == "--":
+        return run_sandbox(argv[2], argv[4:])
     if cmd == "countries":
         for c in Directory().countries():
             print(f"{c['code']}  {c['count']:>6}  {c['name']}")

@@ -9,6 +9,8 @@ Run from the repository root:  python3 -m unittest discover -s tests -v
 
 import http.server
 import os
+import shutil
+import tempfile
 import socket
 import threading
 import unittest
@@ -56,7 +58,10 @@ class PublicIpTest(unittest.TestCase):
         for ip in ["127.0.0.1", "127.8.9.10", "0.0.0.0", "10.0.0.1", "172.16.5.4",
                    "192.168.1.1", "169.254.169.254", "100.64.0.1", "224.0.0.1",
                    "255.255.255.255", "::1", "::", "fe80::1", "fc00::1", "fd12::1",
-                   "::ffff:127.0.0.1", "::ffff:192.168.0.1", "ff02::1", "not-an-ip"]:
+                   "::ffff:127.0.0.1", "::ffff:192.168.0.1", "ff02::1", "not-an-ip",
+                   # IPv6 forms carrying a private IPv4: 6to4, NAT64, IPv4-compatible, Teredo
+                   "2002:7f00:1::1", "2002:c0a8:101::1", "64:ff9b::7f00:1", "64:ff9b::a00:1",
+                   "::127.0.0.1", "2001:0:4136:e378:8000:63bf:3fff:fdd2"]:
             self.assertFalse(hz.public_ip(ip), ip)
 
     def test_accepts_public(self):
@@ -98,8 +103,9 @@ class OpenerTest(unittest.TestCase):
     def test_redirect_hops_are_checked(self):
         # A "public" server (127.0.0.2, whitelisted only inside this test)
         # redirects to the loopback server. The hop must be refused.
-        original = hz.public_ip
+        original, original_route = hz.public_ip, hz.routes_to_this_machine
         hz.public_ip = lambda a: a == "127.0.0.2" or original(a)
+        hz.routes_to_this_machine = lambda a: a != "127.0.0.2" and original_route(a)
         try:
             front, front_hits = serve("127.0.0.2", redirect_to=f"http://127.0.0.1:{self.port}/secret")
             try:
@@ -110,7 +116,7 @@ class OpenerTest(unittest.TestCase):
                 front.shutdown()
                 front.server_close()
         finally:
-            hz.public_ip = original
+            hz.public_ip, hz.routes_to_this_machine = original, original_route
 
     def test_artwork_fetch_refuses_local_logo(self):
         art = hz.Artwork.__new__(hz.Artwork)  # no worker threads needed
@@ -124,6 +130,93 @@ class OpenerTest(unittest.TestCase):
         self.assertFalse(hz.public_stream(f"http://127.0.0.1:{self.port}/stream"))
         self.assertFalse(hz.public_stream("http://192.168.0.10:8000/radio.mp3"))
         self.assertFalse(hz.public_stream("http://localhost:8000/"))
+
+
+class PortTest(unittest.TestCase):
+    def test_bad_ports_refused_before_any_lookup(self):
+        for port in (22, 25, 53, 110, 143, 465, 587, 993, 6667, 0, 70000):
+            with self.assertRaises(hz.BlockedAddress, msg=port):
+                hz.public_connection(None)(("example.invalid", port), timeout=1)
+
+
+class RouteTest(unittest.TestCase):
+    def test_loopback_routes_locally(self):
+        self.assertTrue(hz.routes_to_this_machine("127.0.0.1"))
+
+    @unittest.skipUnless(shutil.which("ip"), "needs iproute2")
+    def test_public_address_is_not_local(self):
+        self.assertFalse(hz.routes_to_this_machine("1.1.1.1"))
+
+
+class PrivateDirTest(unittest.TestCase):
+    def test_refuses_symlink_and_fixes_mode(self):
+        base = tempfile.mkdtemp()
+        try:
+            real = os.path.join(base, "real")
+            os.mkdir(real, 0o755)
+            self.assertEqual(hz.private_dir(real), real)
+            self.assertEqual(os.stat(real).st_mode & 0o777, 0o700)
+            link = os.path.join(base, "link")
+            os.symlink(real, link)
+            with self.assertRaises(PermissionError):
+                hz.private_dir(link)
+        finally:
+            shutil.rmtree(base)
+
+
+class SniffTest(unittest.TestCase):
+    def test_only_known_raster_formats(self):
+        self.assertEqual(hz.Artwork.sniff(b"\x89PNG\r\n\x1a\n" + b"0" * 20), ".png")
+        self.assertEqual(hz.Artwork.sniff(b"\xff\xd8\xff" + b"0" * 20), ".jpg")
+        self.assertIsNone(hz.Artwork.sniff(b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'))
+        self.assertIsNone(hz.Artwork.sniff(b"<html><body>not an image</body></html>"))
+
+
+class ProxyTest(unittest.TestCase):
+    """The player's proxy: every request is checked like any other connection."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "p.sock")
+        self.proxy = hz.GuardedProxy(self.path)
+        threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
+        self.target, self.hits = serve("127.0.0.1")
+        self.port = self.target.server_address[1]
+
+    def tearDown(self):
+        self.proxy.shutdown()
+        self.proxy.server_close()
+        self.target.shutdown()
+        self.target.server_close()
+        shutil.rmtree(self.dir)
+
+    def ask(self, raw):
+        with socket.socket(socket.AF_UNIX) as c:
+            c.settimeout(5)
+            c.connect(self.path)
+            c.sendall(raw)
+            return c.recv(4096).split(b"\r\n", 1)[0]
+
+    def test_connect_to_loopback_refused(self):
+        self.assertIn(b"403", self.ask(f"CONNECT 127.0.0.1:{self.port} HTTP/1.1\r\n\r\n".encode()))
+        self.assertIn(b"403", self.ask(f"CONNECT localhost:{self.port} HTTP/1.1\r\n\r\n".encode()))
+        self.assertEqual(self.hits, [])
+
+    def test_absolute_get_to_loopback_refused(self):
+        self.assertIn(b"403", self.ask(
+            f"GET http://127.0.0.1:{self.port}/x HTTP/1.1\r\nHost: x\r\n\r\n".encode()))
+        self.assertIn(b"403", self.ask(b"GET http://169.254.169.254/latest HTTP/1.1\r\n\r\n"))
+        self.assertEqual(self.hits, [])
+
+    def test_malformed_requests(self):
+        self.assertIn(b"405", self.ask(b"POST http://example.com/ HTTP/1.1\r\n\r\n"))
+        self.assertIn(b"400", self.ask(b"GET http://user:pw@example.com/ HTTP/1.1\r\n\r\n"))
+        self.assertIn(b"400", self.ask(b"GET ftp://example.com/ HTTP/1.1\r\n\r\n"))
+        self.assertIn(b"400", self.ask(b"CONNECT user@example.com:443 HTTP/1.1\r\n\r\n"))
+        self.assertIn(b"431", self.ask(b"GET http://example.com/ HTTP/1.1\r\nX: " + b"a" * 70000 + b"\r\n\r\n"))
+
+    def test_bad_port_refused(self):
+        self.assertIn(b"403", self.ask(b"CONNECT example.com:25 HTTP/1.1\r\n\r\n"))
 
 
 def online():
@@ -146,6 +239,22 @@ class PublicInternetTest(unittest.TestCase):
     def test_directory_api_still_works(self):
         items, _more = hz.Directory().search(["jazz"], "", 0)
         self.assertTrue(items)
+
+    def test_proxy_reaches_public_https(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "p.sock")
+            proxy = hz.GuardedProxy(path)
+            threading.Thread(target=proxy.serve_forever, daemon=True).start()
+            with socket.socket(socket.AF_UNIX) as c:
+                c.settimeout(10)
+                c.connect(path)
+                c.sendall(b"CONNECT radioparadise.com:443 HTTP/1.1\r\n\r\n")
+                self.assertIn(b"200", c.recv(4096))
+            proxy.shutdown()
+            proxy.server_close()
+        finally:
+            shutil.rmtree(d)
 
     def test_real_stream_host_is_public(self):
         self.assertTrue(hz.public_stream("http://stream-uk1.radioparadise.com/aac-320"))

@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.0 — 2026-09-24
+
+Security review, prompted by marketplace review of 1.0.1.
+
+- **Sandboxed player.** mpv now runs in bubblewrap with its own empty network
+  namespace, no capabilities and a read-only filesystem. Its only way out is a
+  guarded HTTP/HTTPS proxy, so redirects, `.m3u`/`.pls` entries, HLS segments
+  and mpv's own DNS lookups can no longer reach local or private addresses.
+  The sandbox checks itself and refuses to start the player if it isn't sealed.
+- Address policy also refuses IPv6 forms embedding a private IPv4 address
+  (6to4, Teredo, NAT64, IPv4-compatible) and addresses that route to this
+  machine; WHATWG "bad ports" are refused.
+- Stream TLS certificates are verified (`--tls-verify=yes`); yt-dlp is never
+  used (`--ytdl=no`).
+- Logos: format is taken from the bytes, not the Content-Type; SVG is no
+  longer shown; the cache is bounded.
+- The runtime folder must be a private, user-owned directory (no symlinks);
+  files are created with `umask 077`.
+- `SECURITY.md` describes the threat model; `tests/test_player_sandbox.py`
+  tests the real sandboxed player against hostile URLs.
+
 ## 1.0.1 — 2026-09-24
 
 - Security: station logo and stream URLs from the directory can no longer
