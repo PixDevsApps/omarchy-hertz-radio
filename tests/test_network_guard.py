@@ -149,6 +149,41 @@ class HttpsOnlyApiTest(unittest.TestCase):
                                      {}, "http://example.com/downgraded")
 
 
+class IPv6FormsTest(unittest.TestCase):
+    def test_mapped_and_compatible_refused_nat64_follows_embedded(self):
+        for a in ("::ffff:1.1.1.1", "::ffff:10.0.0.12", "::1.1.1.1", "64:ff9b::a00:1", "64:ff9b::7f00:1"):
+            self.assertFalse(hz.public_ip(a), a)
+        self.assertTrue(hz.public_ip("64:ff9b::808:808"))
+
+
+class DefaultRouteTest(unittest.TestCase):
+    """Route decisions against simulated routing tables."""
+
+    def decide(self, route, defaults):
+        saved = hz._ip_json
+        hz._route_cache.clear()
+        hz._ip_json = lambda *a: defaults if "show" in a else [route]
+        try:
+            return hz.routes_to_this_machine("203.0.113.9")
+        finally:
+            hz._ip_json = saved
+            hz._route_cache.clear()
+
+    def test_rules(self):
+        wifi = [{"dst": "default", "gateway": "10.0.0.1", "dev": "wlo1"}]
+        wg_full = [{"dst": "default", "dev": "wg0"}]
+        ecmp = [{"dst": "default", "nexthops": [{"gateway": "10.0.0.1", "dev": "eth0"},
+                                                {"gateway": "10.1.0.1", "dev": "eth1"}]}]
+        self.assertFalse(self.decide({"dev": "wlo1", "gateway": "10.0.0.1"}, wifi))
+        self.assertTrue(self.decide({"dev": "wlo1"}, wifi))                  # on the LAN
+        self.assertTrue(self.decide({"dev": "tun0", "gateway": "10.8.0.1"}, wifi))   # VPN-specific route
+        self.assertTrue(self.decide({"dev": "lo", "type": "local"}, wifi))
+        self.assertFalse(self.decide({"dev": "wg0"}, wg_full))               # full-tunnel WireGuard
+        self.assertTrue(self.decide({"dev": "wlo1"}, wg_full))               # LAN while on the VPN
+        self.assertFalse(self.decide({"dev": "eth1", "gateway": "10.1.0.1"}, ecmp))
+        self.assertTrue(self.decide({"dev": "wlo1", "gateway": "10.0.0.1"}, []))   # no default: closed
+
+
 class PortTest(unittest.TestCase):
     def test_bad_ports_refused_before_any_lookup(self):
         for port in (22, 25, 53, 110, 143, 465, 587, 993, 6667, 0, 70000):

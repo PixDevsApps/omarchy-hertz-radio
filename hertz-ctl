@@ -32,6 +32,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import os
 import queue
 import random
@@ -50,6 +51,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zlib
 
 VERSION = "1.2.0"
 USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
@@ -62,8 +64,7 @@ RUNTIME = (os.environ.get("HERTZ_RADIO_RUNTIME")      # tests only: a separate p
            or (os.path.join(os.environ["XDG_RUNTIME_DIR"], "hertz-radio")
                if os.environ.get("XDG_RUNTIME_DIR") else os.path.join(CACHE, "run")))
 ART_DIR = os.path.join(CACHE, "logos")   # sandbox-transcoded PNGs only
-PLAYER_DIR = os.path.join(RUNTIME, "player")   # the sandbox's only writable dir
-SOCKET = os.path.join(PLAYER_DIR, "mpv.sock")
+SOCKET = os.path.join(RUNTIME, "mpv.sock")   # the player session's relay to mpv
 SESSION_FILE = os.path.join(RUNTIME, "session.json")
 STATE_FILE = os.path.join(DATA, "state.json")
 LIST_CACHE = os.path.join(CACHE, "lists.json")
@@ -94,7 +95,9 @@ out_lock = threading.Lock()
 
 
 def emit(obj):
-    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    # ASCII escapes: no string (e.g. a lone surrogate from a stream title) can
+    # make the write fail.
+    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=True)
     with out_lock:
         try:
             sys.stdout.write(line + "\n")
@@ -170,19 +173,20 @@ def public_ip(address):
     except ValueError:
         return False
     if ip.version == 6:
+        # IPv4-mapped (::ffff:a.b.c.d) would be routed and connected as IPv4
+        # behind the IPv6 route check's back, and IPv4-compatible (::a.b.c.d)
+        # is obsolete: refuse both outright.
+        if ip.ipv4_mapped or ip in IPV4_COMPATIBLE:
+            return False
+        if ip in NAT64:                  # 64:ff9b::/96 on IPv6-only networks
+            return _public(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
         embedded = []
-        if ip.ipv4_mapped:
-            embedded.append(ip.ipv4_mapped)
         if ip.sixtofour:
             embedded.append(ip.sixtofour)
         if ip.teredo:
             embedded.extend(ip.teredo)
-        if ip in NAT64 or ip in IPV4_COMPATIBLE:
-            embedded.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
         if any(not _public(v4) for v4 in embedded):
             return False
-        if ip.ipv4_mapped:
-            return True
     return _public(ip)
 
 
@@ -212,9 +216,17 @@ def _cached(key, compute):
 
 
 def _default_devices(family):
-    return _cached(("default", family), lambda: frozenset(
-        r.get("dev") for r in _ip_json(family, "route", "show", "default")
-        if isinstance(r, dict) and r.get("dev")))
+    """{device: has_gateway} for every default route (multipath included)."""
+    def compute():
+        devices = {}
+        for r in _ip_json(family, "route", "show", "default"):
+            if not isinstance(r, dict):
+                continue
+            for hop in r.get("nexthops") if isinstance(r.get("nexthops"), list) else [r]:
+                if isinstance(hop, dict) and hop.get("dev"):
+                    devices[hop["dev"]] = devices.get(hop["dev"], False) or bool(hop.get("gateway"))
+        return devices
+    return _cached(("default", family), compute)
 
 
 def routes_to_this_machine(address):
@@ -234,7 +246,11 @@ def routes_to_this_machine(address):
             return True
         for r in routes:
             if not isinstance(r, dict) or r.get("type") in ("local", "broadcast", "multicast") \
-                    or r.get("dev") == "lo" or not r.get("gateway") or r.get("dev") not in defaults:
+                    or r.get("dev") == "lo" or r.get("dev") not in defaults:
+                return True
+            # Through a gateway, or through a point-to-point default route
+            # (full-tunnel VPN, PPP) whose default itself has no gateway.
+            if not r.get("gateway") and defaults[r.get("dev")]:
                 return True
         return False
     return _cached(("route", address), compute)
@@ -635,18 +651,22 @@ class _Bridge(_LimitedServer, socketserver.ThreadingTCPServer):
 
 SANDBOX_ETC = ("/etc/ld.so.cache", "/etc/ssl", "/etc/ca-certificates", "/etc/pkcs11",
                "/etc/gnutls", "/etc/localtime", "/etc/fonts")
-SANDBOX_RUN = "/run/hertz"                 # the player's control dir inside the sandbox
 SANDBOX_PROXY = "/run/hertz-proxy.sock"    # the proxy socket inside the sandbox
 SANDBOX_SCRIPT = "/opt/hertz-radio/hertz-ctl"
+SANDBOX_IPC_FD = 200                       # mpv's control connection (same number inside)
 
-# x86_64 syscalls refused inside the sandbox (EPERM), clone3 answers ENOSYS so
-# libc falls back to clone. Any other architecture/ABI (i386 via int 0x80,
+# x86_64 syscalls refused inside the sandbox (EPERM); clone3 answers ENOSYS so
+# libc falls back to clone. socket()/socketpair() are limited to Unix, IPv4 and
+# IPv6 (no vsock, RDS, AF_ALG, netlink, packet...), personality() to its
+# default and query values. Any other architecture/ABI (i386 via int 0x80,
 # x32) is killed, so the list can't be sidestepped.
-_SECCOMP_DENY = (101, 103, 134, 153, 155, 161, 163, 165, 166, 167, 168, 169, 170, 171,
-                 172, 173, 175, 176, 179, 212, 246, 248, 249, 250, 272, 298, 300, 303,
-                 304, 308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428, 429,
-                 430, 431, 432, 433, 442)
+_SECCOMP_DENY = (101, 103, 134, 153, 154, 155, 161, 163, 165, 166, 167, 168, 169, 170,
+                 171, 172, 173, 175, 176, 179, 212, 246, 248, 249, 250, 272, 298, 300,
+                 303, 304, 308, 310, 311, 312, 313, 320, 321, 323, 425, 426, 427, 428,
+                 429, 430, 431, 432, 433, 442)
 _SECCOMP_ENOSYS = (435,)
+_NR_SOCKET, _NR_SOCKETPAIR, _NR_PERSONALITY = 41, 53, 135
+_ALLOWED_FAMILIES = (socket.AF_UNIX, socket.AF_INET, socket.AF_INET6)
 
 
 def seccomp_program():
@@ -656,59 +676,111 @@ def seccomp_program():
     AUDIT_ARCH_X86_64 = 0xC000003E
     LD, JEQ, JGE, RET = 0x20, 0x15, 0x35, 0x06
     ALLOW, KILL, ERRNO = 0x7FFF0000, 0x80000000, 0x00050000
-    prog = [(LD, 0, 0, 4),                         # A = arch
-            (JEQ, 1, 0, AUDIT_ARCH_X86_64),
-            (RET, 0, 0, KILL),
-            (LD, 0, 0, 0),                         # A = syscall number
-            (JGE, 0, 1, 0x40000000),               # x32 ABI
-            (RET, 0, 0, KILL)]
+    ARG0 = 16                                  # low 32 bits of args[0] (little endian)
+    prog, labels = [], {}
+
+    def op(code, k=0, jt=0, jf=0):
+        prog.append([code, jt, jf, k])
+
+    def label(name):
+        labels[name] = len(prog)
+
+    op(LD, 4)                                  # A = arch
+    op(JEQ, AUDIT_ARCH_X86_64, 1, 0)
+    op(RET, KILL)
+    op(LD, 0)                                  # A = syscall number
+    op(JGE, 0x40000000, 0, 1)                  # x32 ABI
+    op(RET, KILL)
+    op(JEQ, _NR_SOCKET, "socket", 0)
+    op(JEQ, _NR_SOCKETPAIR, "socket", 0)
+    op(JEQ, _NR_PERSONALITY, "personality", 0)
     for nr in _SECCOMP_DENY:
-        prog += [(JEQ, 0, 1, nr), (RET, 0, 0, ERRNO | errno.EPERM)]
+        op(JEQ, nr, 0, 1)
+        op(RET, ERRNO | errno.EPERM)
     for nr in _SECCOMP_ENOSYS:
-        prog += [(JEQ, 0, 1, nr), (RET, 0, 0, ERRNO | errno.ENOSYS)]
-    prog.append((RET, 0, 0, ALLOW))
+        op(JEQ, nr, 0, 1)
+        op(RET, ERRNO | errno.ENOSYS)
+    op(RET, ALLOW)
+    label("socket")
+    op(LD, ARG0)
+    for family in _ALLOWED_FAMILIES:
+        op(JEQ, family, "allow", 0)
+    op(RET, ERRNO | errno.EAFNOSUPPORT)
+    label("personality")
+    op(LD, ARG0)
+    op(JEQ, 0, "allow", 0)
+    op(JEQ, 0xFFFFFFFF, "allow", 0)
+    op(RET, ERRNO | errno.EPERM)
+    label("allow")
+    op(RET, ALLOW)
+    for i, ins in enumerate(prog):             # resolve relative jump targets
+        for slot in (1, 2):
+            if isinstance(ins[slot], str):
+                offset = labels[ins[slot]] - (i + 1)
+                assert 0 <= offset <= 255, "seccomp jump out of range"
+                ins[slot] = offset
     return b"".join(struct.pack("=HBBI", *ins) for ins in prog)
 
 
-def sandbox_command(extra_binds=(), extra_env=()):
+def _memfd(name, data):
+    fd = os.memfd_create(name, 0)
+    os.write(fd, data)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return fd
+
+
+def sandbox_command(extra_binds=(), extra_env=(), with_script=False):
     """bwrap argument list (without the command) and the fds it needs."""
     bwrap = shutil.which("bwrap")
     if not bwrap:
         raise OSError("bubblewrap (bwrap) is required")
     cmd = [bwrap, "--unshare-all", "--unshare-user", "--disable-userns", "--cap-drop", "ALL",
-           "--die-with-parent", "--new-session", "--clearenv",
+           "--die-with-parent", "--new-session", "--clearenv", "--hostname", "hertz",
            "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp",
            "--setenv", "LANG", "C.UTF-8",
            "--ro-bind", "/usr", "/usr",
-           "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
-           "--dir", "/etc", "--dir", "/opt/hertz-radio",
-           "--ro-bind", os.path.realpath(__file__), SANDBOX_SCRIPT]
+           "--dev", "/dev", "--remount-ro", "/dev",
+           "--proc", "/proc", "--ro-bind", "/dev/null", "/proc/cmdline",
+           "--size", str(SANDBOX_TMP_SIZE), "--tmpfs", "/tmp",
+           "--size", str(1 << 20), "--tmpfs", "/run",
+           "--dir", "/etc"]
     for link in ("/bin", "/sbin", "/lib", "/lib64"):
         if os.path.islink(link):
             cmd += ["--symlink", os.readlink(link), link]
     for path in SANDBOX_ETC:
         cmd += ["--ro-bind-try", path, path]
+    fds = []
+    if with_script:
+        # Copied in (not bind-mounted), so no host path shows inside.
+        with open(os.path.realpath(__file__), "rb") as f:
+            fd = _memfd("hertz-ctl", f.read())
+        fds.append(fd)
+        cmd += ["--dir", os.path.dirname(SANDBOX_SCRIPT), "--perms", "0555", "--file", str(fd), SANDBOX_SCRIPT]
     for mode, src, dst in extra_binds:
         cmd += [mode, src, dst]
     for name, value in extra_env:
         cmd += ["--setenv", name, value]
-    fds = []
+    # The sandbox root is bubblewrap's own (unsized) tmpfs: make it read-only
+    # once everything is in place. /tmp and /run stay writable, size-limited.
+    cmd += ["--remount-ro", "/"]
     program = seccomp_program()
     if program is not None:
-        r, w = os.pipe()
-        os.write(w, program)
-        os.close(w)
-        cmd += ["--seccomp", str(r)]
-        fds.append(r)
+        fd = _memfd("hertz-seccomp", program)
+        cmd += ["--seccomp", str(fd)]
+        fds.append(fd)
     return cmd, fds
 
 
+SANDBOX_TMP_SIZE = 16 << 20
+
+
 def mpv_arguments(volume):
-    # No config, scripts or yt-dlp; decoded audio leaves as raw PCM on stdout
-    # (played by pw-cat outside the sandbox), so the player needs no audio
-    # server, no D-Bus and no session sockets at all.
+    # No config, scripts or yt-dlp. Decoded audio leaves as raw PCM on stdout
+    # (played by pw-cat outside the sandbox); control is an inherited socket,
+    # so the player needs no audio server, no D-Bus, no session sockets and
+    # no writable path.
     return ["mpv", "--no-config", "--idle=yes", "--no-video", "--no-terminal", "--really-quiet",
-            f"--input-ipc-server={SANDBOX_RUN}/mpv.sock", f"--volume={volume}", "--volume-max=100",
+            f"--input-ipc-client=fd://{SANDBOX_IPC_FD}", f"--volume={volume}", "--volume-max=100",
             "--ao=pcm", "--ao-pcm-file=/dev/stdout", "--ao-pcm-waveheader=no",
             f"--audio-format={PCM_FORMAT}", f"--audio-samplerate={PCM_RATE}",
             f"--audio-channels={PCM_CHANNELS}",
@@ -722,6 +794,8 @@ PCM_FORMAT, PCM_RATE, PCM_CHANNELS = "s16", 48000, "stereo"
 PLAYER_MEMORY = 1536 * 1024 * 1024   # mpv address space (it reserves ~720 MB, uses ~120 MB)
 SANDBOX_TASKS = 256                   # processes + threads, counted inside the sandbox only
 PLAYER_LOG_LIMIT = 256 * 1024
+PID_FILE = os.path.join(RUNTIME, "player.pid")
+PLAYER_QUIT_GRACE = 3.0
 
 
 def _capped_log(stream, path):
@@ -740,17 +814,101 @@ def _capped_log(stream, path):
         os.close(fd)
 
 
+class _IpcRelay:
+    """Relays mpv's control connection (an inherited socket inside the
+    sandbox) to SOCKET, a Unix socket in the private runtime folder that the
+    sandbox can't see or touch. Several local clients may be connected (the
+    daemon, `hertz-ctl stop`); mpv's messages go to all of them."""
+
+    MAX_CLIENTS = 8
+
+    def __init__(self, mpv_end, path):
+        self.mpv = mpv_end
+        self.clients = set()
+        self.lock = threading.Lock()
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(path)
+        self.server.listen(4)
+        threading.Thread(target=self._accept, daemon=True).start()
+        threading.Thread(target=self._from_mpv, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with self.lock:
+                if len(self.clients) >= self.MAX_CLIENTS:
+                    conn.close()
+                    continue
+                self.clients.add(conn)
+            threading.Thread(target=self._to_mpv, args=(conn,), daemon=True).start()
+
+    def _drop(self, conn):
+        with self.lock:
+            self.clients.discard(conn)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _to_mpv(self, conn):
+        try:
+            for chunk in iter(lambda: conn.recv(65536), b""):
+                with self.lock:
+                    self.mpv.sendall(chunk)
+        except OSError:
+            pass
+        self._drop(conn)
+
+    def _from_mpv(self):
+        try:
+            for chunk in iter(lambda: self.mpv.recv(65536), b""):
+                with self.lock:
+                    clients = list(self.clients)
+                for client in clients:
+                    try:
+                        client.sendall(chunk)
+                    except OSError:
+                        self._drop(client)
+        except OSError:
+            pass
+        self.close()
+
+    def close(self):
+        with self.lock:
+            clients, self.clients = list(self.clients), set()
+        for s in (*clients, self.server):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def process_start(pid):
+    """A process's start time (to recognise it again), or None if it is gone
+    or only a zombie waiting to be reaped."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return None if fields[0] in ("Z", "X") else fields[19]
+    except (OSError, IndexError):
+        return None
+
+
 def run_player(volume):
-    """`hertz-ctl player`: guarded proxy + sandboxed mpv + pw-cat, while mpv runs."""
+    """`hertz-ctl player`: guarded proxy + IPC relay + sandboxed mpv + pw-cat."""
     os.umask(0o077)
+    # When the daemon ends the session with SIGTERM, still run the cleanup below.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     private_dir(RUNTIME)
-    control = private_dir(PLAYER_DIR)      # the only writable path inside the sandbox
     pw_cat = shutil.which("pw-cat")
     if not pw_cat:
         log("player: pw-cat (pipewire) is required for audio output")
         return 3
     proxy_path = os.path.join(RUNTIME, "proxy.sock")
-    for stale in (proxy_path, SOCKET):
+    for stale in (proxy_path, SOCKET):     # both live in the private runtime folder
         if os.path.lexists(stale):
             if not stat.S_ISSOCK(os.lstat(stale).st_mode):
                 log(f"player: {stale} exists and is not a socket")
@@ -758,18 +916,25 @@ def run_player(volume):
             os.unlink(stale)
     proxy = GuardedProxy(proxy_path)
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    relay = _IpcRelay(ours, SOCKET)
     try:
-        cmd, fds = sandbox_command([("--bind", control, SANDBOX_RUN),
-                                    ("--ro-bind", proxy_path, SANDBOX_PROXY)],
-                                   extra_env=[("MALLOC_ARENA_MAX", "2")])
+        cmd, fds = sandbox_command([("--ro-bind", proxy_path, SANDBOX_PROXY)],
+                                   extra_env=[("MALLOC_ARENA_MAX", "2")], with_script=True)
     except OSError as e:
         log(f"player: {e}")
         return 3
-    cmd += ["--", "python3", SANDBOX_SCRIPT, "sandbox", SANDBOX_PROXY, "--", *mpv_arguments(volume)]
+    cmd += ["--", "python3", SANDBOX_SCRIPT, "sandbox", SANDBOX_PROXY, str(SANDBOX_IPC_FD),
+            "--", *mpv_arguments(volume)]
     audio = None
     try:
+        # mpv's control socket gets a fixed, out-of-the-way number, so it can't
+        # collide with the other descriptors handed to bubblewrap.
+        os.dup2(theirs.fileno(), SANDBOX_IPC_FD)
+        theirs.close()
         sandbox = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, pass_fds=fds)
+                                   stderr=subprocess.PIPE, pass_fds=[*fds, SANDBOX_IPC_FD])
+        os.close(SANDBOX_IPC_FD)
         for fd in fds:
             os.close(fd)
         threading.Thread(target=_capped_log, args=(sandbox.stderr, os.path.join(RUNTIME, "player.log")),
@@ -782,6 +947,8 @@ def run_player(volume):
         sandbox.stdout.close()           # pw-cat owns the read end now
         return sandbox.wait()
     finally:
+        relay.close()
+        ours.close()
         if audio is not None:
             audio.terminate()
             try:
@@ -803,7 +970,7 @@ def sandbox_is_sealed():
         caps = {k: v.strip() for k, v in (line.split(":", 1) for line in f if line.startswith("Cap"))}
     if any(int(caps.get(k, "0"), 16) for k in ("CapEff", "CapPrm", "CapAmb", "CapBnd")):
         return False
-    if os.path.exists("/home") and os.listdir("/home"):
+    if os.path.exists("/home"):
         return False
     for family, address in ((socket.AF_INET, ("1.1.1.1", 443)), (socket.AF_INET6, ("2606:4700:4700::1111", 443))):
         try:
@@ -814,10 +981,16 @@ def sandbox_is_sealed():
         except OSError as e:
             if e.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
                 return False
+    try:                                   # the seccomp socket-family filter is active
+        socket.socket(40, socket.SOCK_STREAM).close()     # AF_VSOCK
+        return False
+    except OSError as e:
+        if e.errno != errno.EAFNOSUPPORT:
+            return False
     return True
 
 
-def run_sandbox(proxy_path, mpv_cmd):
+def run_sandbox(proxy_path, ipc_fd, mpv_cmd):
     """`hertz-ctl sandbox` (inside bubblewrap): check the seal, start the bridge, run mpv."""
     if not sandbox_is_sealed():
         print("hertz-ctl: sandbox isolation check failed; refusing to start the player", file=sys.stderr)
@@ -831,17 +1004,25 @@ def run_sandbox(proxy_path, mpv_cmd):
     proxy_url = f"http://127.0.0.1:{bridge.server_address[1]}"
     env = dict(os.environ, http_proxy=proxy_url, https_proxy=proxy_url,
                HTTP_PROXY=proxy_url, HTTPS_PROXY=proxy_url, no_proxy="", NO_PROXY="")
+
     def limits():
         resource.setrlimit(resource.RLIMIT_AS, (PLAYER_MEMORY, PLAYER_MEMORY))
-    return subprocess.run([*mpv_cmd, f"--http-proxy={proxy_url}"], env=env,
+    return subprocess.run([*mpv_cmd, f"--http-proxy={proxy_url}"], env=env, pass_fds=(ipc_fd,),
                           stdin=subprocess.DEVNULL, preexec_fn=limits).returncode
+
+
+# ffmpeg input format per sniffed type: ffmpeg must not probe for others.
+LOGO_DEMUXERS = {".png": "png_pipe", ".jpg": "jpeg_pipe", ".gif": "gif_pipe",
+                 ".webp": "webp_pipe", ".bmp": "bmp_pipe", ".ico": "ico"}
 
 
 def transcode_logo(data):
     """Decode an untrusted logo inside the sandbox (no network at all) and
-    return a small PNG, or None. The shell then only ever decodes our PNG."""
+    return a small PNG rebuilt by rebuild_png(), or None. The shell only ever
+    decodes that PNG."""
     ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or len(data) > MAX_ART:
+    demuxer = LOGO_DEMUXERS.get(Artwork.sniff(data) or "")
+    if not ffmpeg or not demuxer or len(data) > MAX_ART:
         return None
     try:
         # One malloc arena keeps ffmpeg's per-thread reservations small enough
@@ -849,9 +1030,9 @@ def transcode_logo(data):
         cmd, fds = sandbox_command(extra_env=[("MALLOC_ARENA_MAX", "1")])
     except OSError:
         return None
-    cmd += ["--", "prlimit", "--nproc=32", "--", "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
-            "-max_pixels", str(LOGO_MAX_PIXELS), "-i", "pipe:0", "-frames:v", "1", "-map", "0:v:0",
-            "-filter_threads", "1",
+    cmd += ["--", "prlimit", "--nproc=32", "--", "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-threads", "1", "-max_pixels", str(LOGO_MAX_PIXELS), "-f", demuxer, "-i", "pipe:0",
+            "-frames:v", "1", "-map", "0:v:0", "-filter_threads", "1",
             "-vf", f"scale={LOGO_SIZE}:{LOGO_SIZE}:force_original_aspect_ratio=decrease:flags=area,format=rgba",
             "-threads", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1"]
 
@@ -868,13 +1049,61 @@ def transcode_logo(data):
     finally:
         for fd in fds:
             os.close(fd)
-    png = out.stdout
-    if out.returncode != 0 or not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > 256 * 1024:
+    if out.returncode != 0 or len(out.stdout) > 256 * 1024:
         return None
-    width, height = struct.unpack(">II", png[16:24])
-    if not (0 < width <= LOGO_SIZE and 0 < height <= LOGO_SIZE):
+    return rebuild_png(out.stdout)
+
+
+def _png_chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+
+
+def rebuild_png(png):
+    """Strictly parse ffmpeg's output (8-bit RGBA, not interlaced, at most
+    LOGO_SIZE square, valid CRCs, pixel data of exactly the right size with
+    valid filter bytes) and write a fresh, minimal PNG from the pixel data.
+    Anything else is refused, so even a compromised decoder can only hand Qt
+    a well-formed small image written by this function."""
+    if not png.startswith(b"\x89PNG\r\n\x1a\n"):
         return None
-    return png
+    pos, header, idat = 8, None, []
+    while True:
+        if pos + 12 > len(png):
+            return None
+        length, kind = struct.unpack(">I4s", png[pos:pos + 8])
+        body = png[pos + 8:pos + 8 + length]
+        if len(body) != length or pos + 12 + length > len(png):
+            return None
+        crc = struct.unpack(">I", png[pos + 8 + length:pos + 12 + length])[0]
+        if zlib.crc32(kind + body) & 0xFFFFFFFF != crc:
+            return None
+        pos += 12 + length
+        if header is None:
+            if kind != b"IHDR" or length != 13:
+                return None
+            header = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat.append(body)
+        elif kind == b"IEND":
+            break
+        elif kind[:1].isupper():
+            return None                    # unknown critical chunk (e.g. PLTE)
+    width, height, depth, color, compression, filtering, interlace = header
+    if not (0 < width <= LOGO_SIZE and 0 < height <= LOGO_SIZE) or (depth, color, compression,
+                                                                     filtering, interlace) != (8, 6, 0, 0, 0):
+        return None
+    expected = (1 + width * 4) * height
+    inflater = zlib.decompressobj()
+    try:
+        raw = inflater.decompress(b"".join(idat), expected + 1)
+    except zlib.error:
+        return None
+    if len(raw) != expected or inflater.unconsumed_tail:
+        return None
+    if any(raw[row * (1 + width * 4)] > 4 for row in range(height)):
+        return None
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + _png_chunk(b"IDAT", zlib.compress(raw, 6)) + _png_chunk(b"IEND", b""))
 
 
 LOGO_SIZE = 160
@@ -1177,6 +1406,17 @@ def clean_station(d):
     }
 
 
+def clean_countries(items):
+    out = []
+    for c in items if isinstance(items, list) else []:
+        if isinstance(c, dict) and isinstance(c.get("code"), str) and valid_country(c["code"]):
+            out.append({"code": c["code"], "name": _text(c.get("name"), 80) or c["code"],
+                        "count": _int(c.get("count"))})
+        if len(out) >= 400:
+            break
+    return out
+
+
 def clean_stations(items, limit=1000):
     out = []
     for item in items if isinstance(items, list) else []:
@@ -1339,7 +1579,10 @@ class Mpv:
 
     def attach(self):
         """Reuse an mpv left running by a previous daemon, if any."""
-        if not os.path.exists(SOCKET):
+        try:
+            if not stat.S_ISSOCK(os.lstat(SOCKET).st_mode):
+                return False
+        except OSError:
             return False
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1373,6 +1616,7 @@ class Mpv:
             finally:
                 os.close(log_fd)
             threading.Thread(target=proc.wait, daemon=True).start()  # reap on exit
+            write_json(PID_FILE, {"pid": proc.pid, "start": process_start(proc.pid)})
         except OSError as e:
             emit({"type": "error", "message": f"Could not start mpv: {e}"})
             return False
@@ -1382,7 +1626,7 @@ class Mpv:
                 return True
             if proc.poll() is not None:
                 break
-        proc.kill()  # never leave an unreachable player behind
+        self.kill_player()  # never leave an unreachable player behind
         emit({"type": "error", "message": "The sandboxed player could not start (needs mpv, bubblewrap and pw-cat)"})
         return False
 
@@ -1390,6 +1634,7 @@ class Mpv:
         self.sock = s
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
         for i, name in enumerate(self.OBSERVED, 1):
+            self.command("unobserve_property", i)    # a previous daemon's observers
             self.command("observe_property", i, name)
 
     def _reader(self, s):
@@ -1412,10 +1657,13 @@ class Mpv:
                         continue
                     try:
                         msg = json.loads(line)
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         continue
                     if isinstance(msg, dict):
-                        self.on_event(msg)
+                        try:
+                            self.on_event(msg)
+                        except Exception as e:   # a malformed message must not stop the reader
+                            log("mpv event ignored:", type(e).__name__)
         except OSError:
             pass
         with self.lock:
@@ -1437,6 +1685,42 @@ class Mpv:
 
     def quit(self):
         self.command("quit")
+
+    def terminate(self, wait=False):
+        """Ask mpv to quit, and make sure the whole player session is gone a
+        few seconds later even if the sandboxed player ignores the request."""
+        self.quit()
+        if wait:
+            self.kill_player(grace=PLAYER_QUIT_GRACE)
+        else:
+            threading.Thread(target=self.kill_player, kwargs={"grace": PLAYER_QUIT_GRACE},
+                             daemon=True).start()
+
+    @staticmethod
+    def kill_player(grace=0.0):
+        info = read_json(PID_FILE, {})
+        pid, start = info.get("pid"), info.get("start")
+        if not isinstance(pid, int) or pid <= 1 or not start:
+            return
+        alive = lambda: process_start(pid) == start          # not a recycled pid
+        deadline = time.monotonic() + grace
+        while alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        for sig, pause in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 1.0)):
+            if not alive():
+                break
+            try:
+                os.killpg(pid, sig)       # the session's own process group
+            except OSError:
+                break
+            end = time.monotonic() + pause
+            while alive() and time.monotonic() < end:
+                time.sleep(0.1)
+        if not alive():
+            try:
+                os.unlink(PID_FILE)
+            except OSError:
+                pass
 
 
 # ------------------------------------------------------------------ MPRIS
@@ -1601,8 +1885,8 @@ class Daemon:
 
         saved = read_json(STATE_FILE, {})
         self.favorites = clean_stations(saved.get("favorites"))
-        self.volume = max(0, min(100, int(saved.get("volume", 70))))
-        self.last_genre = str(saved.get("genre") or "All")
+        self.volume = _int(saved.get("volume", 70), 0, 100)
+        self.last_genre = _text(saved.get("genre"), 40) or "All"
         self.last_country = saved.get("country") if valid_country(saved.get("country")) else ""
         self.station = clean_station(saved.get("last"))
 
@@ -1676,9 +1960,13 @@ class Daemon:
             self._on_mpv(msg)
 
     def _on_mpv(self, msg):
+        # Everything here comes from the sandboxed player, so it's untrusted:
+        # every value is type-checked, and text is cleaned and bounded.
         ev = msg.get("event")
         if ev == "property-change":
             name, data = msg.get("name"), msg.get("data")
+            if name in ("pause", "core-idle", "paused-for-cache", "mute") and not isinstance(data, bool):
+                return
             if name == "pause":
                 if data and self.mode == "playing":
                     # Paused from outside (media keys): hold briefly, then disconnect.
@@ -1695,25 +1983,28 @@ class Daemon:
                     self.error = ""
                     self.report_click()
             elif name == "path":
-                self.loaded = bool(data)
+                self.loaded = isinstance(data, str) and bool(data)
             elif name == "paused-for-cache":
-                self.buffering = bool(data)
-            elif name == "volume" and data is not None:
-                self.volume = max(0, min(100, int(round(data))))
+                self.buffering = data
+            elif name == "volume":
+                if isinstance(data, (int, float)) and not isinstance(data, bool) and math.isfinite(data):
+                    self.volume = max(0, min(100, int(round(data))))
             elif name == "mute":
-                self.muted = bool(data)
+                self.muted = data
             elif name == "metadata":
-                self.title = icy_title(data or {})
+                self.title = icy_title(data if isinstance(data, dict) else {})
             elif name == "audio-codec-name":
-                self.codec = str(data or "").upper()
+                self.codec = _text(data, 24).upper() if isinstance(data, str) else ""
             elif name == "audio-params/samplerate":
-                self.samplerate = int(data or 0)
+                self.samplerate = _int(data, 0, 768000) if isinstance(data, int) and not isinstance(data, bool) else 0
+            else:
+                return
             self.publish()
         elif ev == "end-file":
             reason = msg.get("reason")
             if reason in ("error", "eof") and self.mode == "playing":
                 self.mode = "off"
-                self.error = friendly_error(msg.get("file_error") or reason)
+                self.error = friendly_error(msg.get("file_error") if isinstance(msg.get("file_error"), str) else reason)
                 self.save_session()
                 self.publish()
         elif ev == "start-file":
@@ -1747,7 +2038,12 @@ class Daemon:
         station = clean_station(station)
         if station is None:
             return
-        if not public_stream(station["url"]):
+        try:
+            with Deadline(10):
+                reachable = public_stream(station["url"])
+        except OSError:
+            reachable = False
+        if not reachable:
             # Directory data is untrusted: never point the player at a local
             # or private-network address.
             self.station = station
@@ -1802,7 +2098,7 @@ class Daemon:
 
     def quit_if_paused(self):
         if self.mode == "paused":
-            self.mpv.quit()
+            self.mpv.terminate()
 
     def schedule(self, delay, fn):
         self.cancel_timer()
@@ -1828,7 +2124,7 @@ class Daemon:
         self.cancel_timer()
         self.error = ""
         self.title = ""
-        self.mpv.quit()
+        self.mpv.terminate()
         self.save_session()
         self.publish()
 
@@ -1983,7 +2279,7 @@ class Daemon:
             self.hello()
 
     def run_countries(self):
-        cached = self.list_cache.get("__countries__")
+        cached = clean_countries(self.list_cache.get("__countries__"))
         if cached:
             emit({"type": "countries", "items": cached, "cached": True})
         try:
@@ -2017,7 +2313,7 @@ class Daemon:
             self.clicked = restored["uuid"]
             self.mode = "playing" if mode == "playing" and attached else "paused" if mode == "paused" else "off"
         if attached and self.mode != "playing":
-            self.mpv.quit()
+            self.mpv.terminate()
         self.hello()
         for line in sys.stdin:
             if line.strip():
@@ -2028,17 +2324,19 @@ class Daemon:
         # Panel went away. Keep a playing stream alive for the next daemon;
         # an idle player has no reason to linger.
         if self.mode != "playing":
-            self.mpv.quit()
+            self.mpv.terminate(wait=True)
 
 
 def icy_title(meta):
-    lowered = {str(k).lower(): v for k, v in meta.items()}
+    """The stream's current title as single-line printable text (control and
+    bidi characters removed), at most 200 characters."""
+    lowered = {str(k).lower(): v for k, v in list(meta.items())[:64] if isinstance(v, str)}
     title = lowered.get("icy-title") or ""
     if not title and lowered.get("title"):
         artist = lowered.get("artist")
-        title = f"{artist} – {lowered['title']}" if artist else lowered["title"]
-    title = " ".join(str(title).split())
-    return "" if title in ("-", " - ") else title[:200]
+        title = f"{artist[:200]} – {lowered['title'][:200]}" if artist else lowered["title"]
+    title = _text(title[:1000], 200)
+    return "" if title in ("-", "–") else title
 
 
 def friendly_error(raw):
@@ -2074,8 +2372,8 @@ def cli(argv):
         return 0
     if cmd == "player":
         return run_player(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 70)
-    if cmd == "sandbox" and len(argv) > 4 and argv[3] == "--":
-        return run_sandbox(argv[2], argv[4:])
+    if cmd == "sandbox" and len(argv) > 5 and argv[4] == "--" and argv[3].isdigit():
+        return run_sandbox(argv[2], int(argv[3]), argv[5:])
     if cmd == "countries":
         for c in Directory().countries():
             print(f"{c['code']}  {c['count']:>6}  {c['name']}")
@@ -2083,7 +2381,9 @@ def cli(argv):
     if cmd == "stop":
         m = Mpv(lambda _msg: None)
         if m.attach():
-            m.quit()
+            m.terminate(wait=True)
+        else:
+            Mpv.kill_player()
         return 0
     if cmd in ("-v", "--version", "version"):
         print(VERSION)

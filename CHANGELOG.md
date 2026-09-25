@@ -29,9 +29,29 @@ Full independent security audit; all findings fixed.
   by `clean_station()`.
 - mpv IPC lines are capped at 1 MiB; the directory API is HTTPS-only,
   redirects included; the route checks respect request deadlines.
-- New tests: sandbox escape probe against every socket on the machine,
-  logo transcoding and decompression bombs, record validation, and IPC and
-  file robustness.
+- A second independent audit, with every finding fixed:
+  - mpv's control connection is an inherited socket, relayed outside the
+    sandbox. The sandbox has no host path it can write.
+  - The root, `/dev` and `/etc` are read-only, and `/tmp` and `/run` are
+    size-limited.
+  - seccomp limits socket families to Unix and IP, and blocks modify_ldt and
+    personality changes.
+  - IPv4-mapped IPv6 is refused. NAT64, full-tunnel VPN and multipath default
+    routes now work.
+  - Everything mpv reports is type-checked and cleaned before reaching the
+    panel or MPRIS, and output is ASCII-escaped.
+  - "Off" ends the whole player process group, even a player that ignores
+    quit.
+  - The hostname is reset, the script is copied in, and `/proc/cmdline` is
+    hidden.
+  - ffmpeg is pinned to the sniffed format, and its PNG is parsed strictly and
+    rebuilt by our own code.
+  - The pre-play address check has a deadline, and local state is validated
+    on startup.
+- New tests: sandbox escape probe against every socket on the machine, a
+  hostile fake mpv, logo bombs and the PNG rebuild, routing tables, record
+  validation, and IPC and file robustness. A mutation check was run for every
+  layer.
 
 ## 1.1.1 — 2026-09-25
 

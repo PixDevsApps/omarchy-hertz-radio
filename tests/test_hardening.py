@@ -6,6 +6,7 @@ Run from the repository root:  python3 -m unittest tests.test_hardening -v
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 
@@ -157,6 +159,182 @@ class RecordValidationTest(unittest.TestCase):
         finally:
             shutil.rmtree(runtime)
             shutil.rmtree(data)
+
+
+class HostileMpvTest(unittest.TestCase):
+    """The daemon treats whatever answers on the player socket as hostile."""
+
+    def test_daemon_survives_and_cleans_hostile_player_messages(self):
+        runtime, data = tempfile.mkdtemp(dir=f"/run/user/{os.getuid()}"), tempfile.mkdtemp()
+        os.chmod(runtime, 0o700)
+        sock_path = os.path.join(runtime, "mpv.sock")
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(sock_path)
+        server.listen(1)
+        nested = "[" * 100000 + "]" * 100000
+        evil = [
+            {"event": "property-change", "name": "metadata", "data": {"icy-title": "A\ud800B \x1b]52;c;ZXZpbA==\x07 \u202eevil"}},
+            {"event": "property-change", "name": "metadata", "data": ["not", "a", "dict"]},
+            {"event": "property-change", "name": "volume", "data": "loud"},
+            {"event": "property-change", "name": "audio-codec-name", "data": "x" * 2_000_000},
+            {"event": "property-change", "name": "audio-codec-name", "data": "\x1b[31mAAC"},
+            {"event": "property-change", "name": "pause", "data": "yes"},
+            {"event": "property-change", "name": "audio-params/samplerate", "data": [1]},
+        ]
+
+        def fake_mpv():
+            conn, _ = server.accept()
+            conn.recv(65536)
+            for msg in evil:
+                conn.sendall((json.dumps(msg) + "\n").encode())
+            conn.sendall(b'{"event":"property-change","name":"volume","data":Infinity}\n')
+            conn.sendall(nested.encode() + b"\n")
+            conn.sendall(b'{"event":"property-change","name":"metadata","data":{"icy-title":"Artist - Song"}}\n')
+            time.sleep(1.5)
+            conn.close()
+        threading.Thread(target=fake_mpv, daemon=True).start()
+        try:
+            with open(os.path.join(runtime, "session.json"), "w") as f:
+                json.dump({"station": {"uuid": "9617a958-0601-11e8-ae97-52543be04c81", "name": "RP",
+                                       "url": "http://stream-uk1.radioparadise.com/aac-320"},
+                           "mode": "playing"}, f)
+            env = dict(os.environ, HERTZ_RADIO_RUNTIME=runtime, XDG_DATA_HOME=data, XDG_CACHE_HOME=data)
+            proc = subprocess.Popen(["python3", os.path.join(ROOT, "hertz-ctl"), "daemon"], env=env,
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(4)
+            proc.stdin.close()
+            out, err = proc.communicate(timeout=20)
+            self.assertNotIn(b"Traceback", err)
+            states = [json.loads(l) for l in out.splitlines() if b'"type":"state"' in l]
+            self.assertTrue(states, "daemon produced no state")
+            for st in states:
+                for field in ("title", "codec"):
+                    value = st[field]
+                    self.assertTrue(all(c.isprintable() for c in value), (field, value[:40]))
+                    self.assertLessEqual(len(value), 200)
+                self.assertIsInstance(st["volume"], int)
+            self.assertIn("Artist - Song", [st["title"] for st in states])
+        finally:
+            server.close()
+            shutil.rmtree(runtime, ignore_errors=True)
+            shutil.rmtree(data, ignore_errors=True)
+
+
+class PlayerKillTest(unittest.TestCase):
+    def test_player_that_ignores_quit_and_sigterm_is_killed(self):
+        runtime = tempfile.mkdtemp()
+        saved = hz.PID_FILE
+        hz.PID_FILE = os.path.join(runtime, "player.pid")
+        stubborn = subprocess.Popen(["python3", "-c", "import signal,time\n"
+                                     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)"],
+                                    start_new_session=True)
+        try:
+            time.sleep(0.3)
+            hz.write_json(hz.PID_FILE, {"pid": stubborn.pid, "start": hz.process_start(stubborn.pid)})
+            hz.Mpv.kill_player(grace=0.5)
+            self.assertEqual(stubborn.wait(timeout=5), -signal.SIGKILL)
+            self.assertFalse(os.path.exists(hz.PID_FILE))
+        finally:
+            hz.PID_FILE = saved
+            if stubborn.poll() is None:
+                stubborn.kill()
+            shutil.rmtree(runtime)
+
+    def test_recycled_pid_is_left_alone(self):
+        runtime = tempfile.mkdtemp()
+        saved = hz.PID_FILE
+        hz.PID_FILE = os.path.join(runtime, "player.pid")
+        other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            hz.write_json(hz.PID_FILE, {"pid": other.pid, "start": "1"})   # wrong start time
+            hz.Mpv.kill_player(grace=0)
+            self.assertIsNone(other.poll())
+        finally:
+            hz.PID_FILE = saved
+            other.kill()
+            shutil.rmtree(runtime)
+
+
+class PngRebuildTest(unittest.TestCase):
+    def png(self, w, h, color=6, depth=8, chunks=(), raw=None, crc_ok=True):
+        rowlen = 1 + w * (4 if color == 6 else 1)
+        raw = raw if raw is not None else b"".join(b"\x00" + b"\x7f" * (rowlen - 1) for _ in range(h))
+        ihdr = struct.pack(">IIBBBBB", w, h, depth, color, 0, 0, 0)
+        out = b"\x89PNG\r\n\x1a\n" + hz._png_chunk(b"IHDR", ihdr)
+        for kind, body in chunks:
+            out += hz._png_chunk(kind, body)
+        idat = hz._png_chunk(b"IDAT", zlib.compress(raw))
+        if not crc_ok:
+            idat = idat[:-1] + bytes([idat[-1] ^ 1])
+        return out + idat + hz._png_chunk(b"IEND", b"")
+
+    def test_valid_rgba_is_rebuilt_not_passed_through(self):
+        src = self.png(10, 5, chunks=[(b"tEXt", b"Comment\x00hello")])
+        out = hz.rebuild_png(src)
+        self.assertIsNotNone(out)
+        self.assertNotEqual(out, src)
+        self.assertNotIn(b"tEXt", out)
+
+    def test_refusals(self):
+        import zlib as z
+        self.assertIsNone(hz.rebuild_png(self.png(200, 5)))                  # too large
+        self.assertIsNone(hz.rebuild_png(self.png(10, 5, color=3, chunks=[(b"PLTE", b"\0" * 3)])))
+        self.assertIsNone(hz.rebuild_png(self.png(10, 5, crc_ok=False)))
+        self.assertIsNone(hz.rebuild_png(self.png(10, 5, raw=b"\x09" * (41 * 5))))   # bad filter byte
+        bomb = b"\x89PNG\r\n\x1a\n" + hz._png_chunk(b"IHDR", struct.pack(">IIBBBBB", 10, 5, 8, 6, 0, 0, 0)) \
+            + hz._png_chunk(b"IDAT", z.compress(b"\0" * 50_000_000)) + hz._png_chunk(b"IEND", b"")
+        start = time.monotonic()
+        self.assertIsNone(hz.rebuild_png(bomb))
+        self.assertLess(time.monotonic() - start, 1)
+        self.assertIsNone(hz.rebuild_png(b"\x89PNG\r\n\x1a\n\0\0"))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("bwrap"), "needs ffmpeg and bubblewrap")
+    def test_transcoder_output_is_our_rebuilt_png(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "x.jpg")
+            ffmpeg_image(path, "200x120")
+            with open(path, "rb") as f:
+                png = hz.transcode_logo(f.read())
+            self.assertIsNotNone(png)
+            self.assertEqual(png, hz.rebuild_png(png), "output must be rebuild_png's canonical form")
+        finally:
+            shutil.rmtree(d)
+
+    def test_ffmpeg_is_told_the_input_format(self):
+        seen = []
+        real_run = hz.subprocess.run
+
+        def capture(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 1, b"", b"")
+        hz.subprocess.run = capture
+        try:
+            samples = {".png": b"\x89PNG\r\n\x1a\n" + b"0" * 32, ".jpg": b"\xff\xd8\xff" + b"0" * 32,
+                       ".gif": b"GIF89a" + b"0" * 32, ".webp": b"RIFF0000WEBP" + b"0" * 32,
+                       ".bmp": b"BM" + b"0" * 32, ".ico": b"\x00\x00\x01\x00" + b"0" * 32}
+            for ext, data in samples.items():
+                seen.clear()
+                hz.transcode_logo(data)
+                cmd = seen[0]
+                self.assertEqual(cmd[cmd.index("-i") - 1], hz.LOGO_DEMUXERS[ext], ext)
+                self.assertEqual(cmd[cmd.index("-i") - 2], "-f", ext)
+        finally:
+            hz.subprocess.run = real_run
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("bwrap"), "needs ffmpeg and bubblewrap")
+    def test_decoder_is_pinned_to_the_sniffed_format(self):
+        # PNG magic followed by a JPEG: ffmpeg must not be allowed to probe its way to it.
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "x.jpg")
+            ffmpeg_image(path, "64x64")
+            with open(path, "rb") as f:
+                jpeg = f.read()
+            self.assertIsNotNone(hz.transcode_logo(jpeg))
+            self.assertIsNone(hz.transcode_logo(b"\x89PNG\r\n\x1a\n" + jpeg))
+        finally:
+            shutil.rmtree(d)
 
 
 class RobustnessTest(unittest.TestCase):

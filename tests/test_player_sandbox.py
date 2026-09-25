@@ -88,7 +88,7 @@ class PlayerSandboxTest(unittest.TestCase):
                    XDG_CACHE_HOME=cls.data)
         cls.player = subprocess.Popen(["python3", CTL, "player", "0"], env=env,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        cls.mpv_sock = os.path.join(cls.runtime, "player", "mpv.sock")
+        cls.mpv_sock = os.path.join(cls.runtime, "mpv.sock")
         for _ in range(200):
             if os.path.exists(cls.mpv_sock):
                 break

@@ -29,7 +29,7 @@ _loader.exec_module(hz)
 
 PROBE = r'''
 import ctypes, errno, json, os, socket, stat, sys
-targets = json.loads(sys.argv[1])
+targets = json.loads(sys.stdin.read())
 out = {"reachable": [], "visible": [], "env": sorted(os.environ), "errors": {}}
 for path in targets["sockets"]:
     try:
@@ -69,6 +69,46 @@ out["errors"]["bpf"] = call(321, 0, 0, 0)
 out["errors"]["ptrace"] = call(101, 0, 1, 0, 0)
 out["errors"]["mount"] = call(165, 0, 0, 0, 0, 0)
 out["errors"]["userfaultfd"] = call(323, 0)
+out["errors"]["modify_ldt"] = call(154, 0, 0, 0)
+out["errors"]["personality_change"] = call(135, 0x0040000)
+out["errors"]["personality_query"] = call(135, 0xFFFFFFFF)
+out["families"] = {}
+for name, fam in (("unix", 1), ("inet", 2), ("inet6", 10), ("netlink", 16), ("packet", 17),
+                  ("rds", 21), ("alg", 38), ("vsock", 40)):
+    try:
+        socket.socket(fam, socket.SOCK_DGRAM if fam in (16, 17, 21) else socket.SOCK_STREAM).close()
+        out["families"][name] = 0
+    except OSError as e:
+        out["families"][name] = e.errno
+out["hostname"] = socket.gethostname()
+try:
+    out["cmdline"] = open("/proc/cmdline").read()
+except OSError:
+    out["cmdline"] = ""          # hidden: not readable at all
+leaks = []
+for path in ("/proc/self/mountinfo", "/proc/1/cmdline", "/proc/self/environ"):
+    try:
+        data = open(path, "rb").read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        continue
+    if targets["home"] in data:
+        leaks.append(path)
+out["home_leaks"] = leaks
+writes = {}
+for d in ("/", "/usr", "/etc", "/opt", "/dev", "/proc", "/tmp", "/run"):
+    try:
+        fd = os.open(os.path.join(d, ".probe"), os.O_WRONLY | os.O_CREAT, 0o600); os.close(fd)
+        writes[d] = "writable"
+    except OSError as e:
+        writes[d] = errno.errorcode.get(e.errno, str(e.errno))
+out["writes"] = writes
+try:
+    with open("/tmp/fill", "wb") as f:
+        for _ in range(64):
+            f.write(b"\0" * (1 << 20))
+    out["tmp_fill"] = "no limit"
+except OSError as e:
+    out["tmp_fill"] = errno.errorcode.get(e.errno, str(e.errno))
 print(json.dumps(out))
 '''
 
@@ -88,7 +128,7 @@ def targets():
     home = os.path.expanduser("~")
     files = [home, os.path.join(home, ".bash_history"), os.path.join(home, ".config"),
              os.path.join(home, ".ssh"), os.path.join(home, ".local/share/keyrings"), ROOT]
-    return {"sockets": sorted(sockets), "files": files}
+    return {"sockets": sorted(sockets), "files": files, "home": home}
 
 
 def stat_is_ipc(mode):
@@ -103,7 +143,7 @@ class SandboxEscapeTest(unittest.TestCase):
         cls.targets = targets()
         cmd, fds = hz.sandbox_command()
         try:
-            result = subprocess.run([*cmd, "--", "python3", "-c", PROBE, json.dumps(cls.targets)],
+            result = subprocess.run([*cmd, "--", "python3", "-c", PROBE], input=json.dumps(cls.targets),
                                     capture_output=True, text=True, timeout=60, pass_fds=fds)
         finally:
             for fd in fds:
@@ -111,7 +151,7 @@ class SandboxEscapeTest(unittest.TestCase):
         if result.returncode != 0:
             raise RuntimeError(result.stderr)
         cls.inside = json.loads(result.stdout)
-        control = subprocess.run(["python3", "-c", PROBE, json.dumps(cls.targets)],
+        control = subprocess.run(["python3", "-c", PROBE], input=json.dumps(cls.targets),
                                  capture_output=True, text=True, timeout=60)
         cls.outside = json.loads(control.stdout)
 
@@ -132,12 +172,31 @@ class SandboxEscapeTest(unittest.TestCase):
         for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
             self.assertEqual(int(self.inside["caps"][key], 16), 0, key)
 
+    def test_only_unix_and_ip_socket_families(self):
+        fam = self.inside["families"]
+        for ok in ("unix", "inet", "inet6"):
+            self.assertEqual(fam[ok], 0, ok)
+        for blocked in ("netlink", "packet", "rds", "alg", "vsock"):
+            self.assertEqual(fam[blocked], errno_value("EAFNOSUPPORT"), blocked)
+
+    def test_no_host_identity_leaks(self):
+        self.assertEqual(self.inside["hostname"], "hertz")
+        self.assertEqual(self.inside["cmdline"], "")
+        self.assertEqual(self.inside["home_leaks"], [])
+
+    def test_nothing_writable_but_small_private_tmpfs(self):
+        writes = self.inside["writes"]
+        self.assertEqual({d for d, r in writes.items() if r == "writable"}, {"/tmp", "/run"})
+        self.assertEqual(self.inside["tmp_fill"], "ENOSPC")
+
     def test_namespace_and_kernel_interfaces_blocked(self):
         errors = self.inside["errors"]
         # nested user namespaces are disabled by bubblewrap (ENOSPC) or refused by seccomp
         self.assertIn(errors["unshare_user"], (errno_value("EPERM"), errno_value("ENOSPC")))
-        for name in ("unshare_ns", "io_uring_setup", "keyctl", "bpf", "ptrace", "mount", "userfaultfd"):
+        for name in ("unshare_ns", "io_uring_setup", "keyctl", "bpf", "ptrace", "mount", "userfaultfd",
+                     "modify_ldt", "personality_change"):
             self.assertEqual(errors[name], errno_value("EPERM"), name)
+        self.assertEqual(errors["personality_query"], 0)
 
 
 def errno_value(name):
