@@ -97,6 +97,12 @@ through the proxy, is made by `public_connection()`:
   interface that carries a default route**. The exception is a
   point-to-point default route with no gateway itself, such as a
   full-tunnel VPN or PPP. The check uses `ip route get` and fails closed.
+  The selected policy table is checked, including defaults split into
+  multiple prefixes by a TUN such as sing-box. Coverage must span the entire
+  address family on the same device and in the same table; only RFC 1918 /
+  IPv6 ULA and link-local gaps may be ignored. Those gaps remain forbidden
+  destinations by the address check above. A limited VPN route alone does
+  not qualify as an internet route.
   That refuses this machine's own addresses, everything directly on the LAN
   (including LAN devices with public IPv6 addresses) and specific routes into
   VPNs.
