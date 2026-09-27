@@ -69,9 +69,10 @@ removed) and length-limited, messages are capped at 1 MiB, and malformed
 input is dropped. The same cleaned text goes to the panel and to MPRIS.
 Output to the panel is ASCII-escaped JSON.
 
-**Stopping.** "Off" asks mpv to quit, then ends the whole player process
-group (SIGTERM, then SIGKILL) if it's still there a few seconds later, so a
-player that ignores the request can't keep running.
+**Stopping.** Pause and Off end the whole player process group (SIGTERM,
+then SIGKILL if needed). This stops both mpv and the audio output process,
+so already decoded audio does not keep playing after the button changes.
+The selected station is kept; Play opens a fresh connection to the live stream.
 
 **Media keys** (MPRIS) are published by the daemon, not by mpv. MPRIS
 `OpenUri` is refused.
@@ -181,6 +182,7 @@ python3 -m unittest discover -s tests -v
 | `tests/test_sandbox_escape.py` | Runs a probe inside the real sandbox against every socket and personal file that exists on the machine, the environment, capabilities, blocked syscalls and socket families, host identity leaks, writable paths and tmpfs limits. A control run without the sandbox confirms the probe finds the sockets |
 | `tests/test_player_sandbox.py` | The real player against hostile URLs (loopback, LAN, redirect to loopback, `.m3u` and HLS playlists pointing at loopback, `tcp://`), with unsandboxed controls; public HTTP, HTTPS and HLS still play |
 | `tests/test_hardening.py` | Logo transcoding (all formats, decompression bombs, corrupt input, pinned decoder, PNG rebuild), a hostile fake mpv (lone surrogates, escape sequences, wrong types, nested JSON, huge strings), killing a player that ignores quit and SIGTERM, record validation, a corrupt session file, the IPC line cap, symlink-safe writes |
+| `tests/test_pause_latency.py` | Synthetic audio through the real sandboxed player and a paced PCM consumer, repeated Pause/Play, mute and volume preservation, failed player replacement, old IPC events, and cleanup of an old player record |
 
 Mutation checks were run for each layer: removing a protection makes its
 tests fail.

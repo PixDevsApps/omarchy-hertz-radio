@@ -99,10 +99,10 @@ Omarchy. The sandbox needs unprivileged user namespaces (the Arch default).
 | `Esc` | Clear search, then close |
 
 Paused and off both use no bandwidth. **Pause** disconnects the stream and
-keeps the station ready, and **Play** rejoins the live broadcast. A pause from
-media keys keeps the stream for 10 seconds so a quick resume is instant, then
-disconnects too. The **power button** in the player (or a right click on the bar
-icon) turns the radio off entirely, shutting down the player process as well.
+ends the player and audio output processes, so queued sound does not keep
+playing. The station stays selected, and **Play** opens a fresh connection to
+the live broadcast. Media keys use the same actions. The **power button** in
+the player (or a right click on the bar icon) turns the radio off.
 In both states the bar shows only the icon. Previous and next move through
 the list you picked the station from.
 
