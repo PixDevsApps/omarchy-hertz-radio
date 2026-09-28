@@ -92,9 +92,9 @@ class LogoTest(unittest.TestCase):
         server = http.server.ThreadingHTTPServer(("127.0.0.2", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         cache = tempfile.mkdtemp()
-        saved = (hz.public_ip, hz.routes_to_this_machine, hz.ART_OPENER, hz.ART_DIR)
+        saved = (hz.public_ip, hz.route_verdict, hz.ART_OPENER, hz.ART_DIR)
         hz.public_ip = lambda a: a == "127.0.0.2" or saved[0](a)
-        hz.routes_to_this_machine = lambda a: a != "127.0.0.2" and saved[1](a)
+        hz.route_verdict = lambda a: hz.ROUTE_INTERNET if a == "127.0.0.2" else saved[1](a)
         hz.ART_OPENER, hz.ART_DIR = hz.guarded_opener(), cache
         try:
             art = hz.Artwork.__new__(hz.Artwork)
@@ -107,7 +107,7 @@ class LogoTest(unittest.TestCase):
             self.assertTrue(stored.startswith(b"\x89PNG"))
             self.assertEqual([n for n in os.listdir(cache) if not n.endswith(".png")], [])
         finally:
-            hz.public_ip, hz.routes_to_this_machine, hz.ART_OPENER, hz.ART_DIR = saved
+            hz.public_ip, hz.route_verdict, hz.ART_OPENER, hz.ART_DIR = saved
             server.shutdown()
             server.server_close()
             shutil.rmtree(cache)

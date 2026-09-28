@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.1 — 2026-09-28
+
+- **Pause stops the sound at once** (#3, by @Wolfengo). Pause, Off and station
+  changes end the player session, including the audio output process, so
+  already decoded audio no longer plays on for a couple of seconds. Play
+  opens a fresh connection to the live stream.
+- **TUN proxies such as sing-box** (#2, by @Wolfengo): the route check now
+  reads the policy table the kernel actually selects, including default routes
+  split into many prefixes, so stations load with a TUN running.
+- **LAN stays refused behind a TUN.** Addresses in a directly connected
+  prefix in the main table are refused even when a TUN or policy table
+  captures them, so LAN devices with public IPv6 addresses can't be reached
+  through a proxy's direct route.
+- **IPv4-only networks work again** (#1, reported by @Htoratsa). An address
+  the kernel has no route to, such as the IPv6 address of a dual-stack host,
+  is skipped instead of making the whole host fail, and is never connected
+  to. Non-public and LAN addresses still refuse the host.
+
 ## 1.2.0 — 2026-09-25
 
 Full independent security audit; all findings fixed.

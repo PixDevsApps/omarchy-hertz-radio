@@ -53,7 +53,7 @@ import urllib.parse
 import urllib.request
 import zlib
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
 HERE = os.path.dirname(os.path.realpath(__file__))
 
@@ -254,34 +254,87 @@ def _default_devices(family, table="main"):
     return _cached(("default", family, str(table)), compute)
 
 
-def routes_to_this_machine(address):
-    """True unless the kernel would send `address` out through a gateway on an
-    interface that carries a default route (possibly fragmented, in the
-    selected policy table). That refuses this machine's own
-    addresses, anything directly on the LAN (including LAN devices with
-    public IPv6 addresses) and specific routes into VPNs or other networks.
-    Fails closed if routing can't be read."""
+ROUTE_INTERNET, ROUTE_FORBIDDEN, ROUTE_NONE = "internet", "forbidden", "none"
+
+
+def _main_table(family):
+    return _cached(("table", family, "main"), lambda: _ip_json(family, "route", "show", "table", "main"))
+
+
+def _in_directly_connected_prefix(family, address):
+    """True if `address` lies in a directly connected (gateway-free) prefix in
+    the main table, other than the routes of a point-to-point internet link.
+
+    A TUN proxy or policy table can capture everything, including a LAN that
+    uses public (typically IPv6) addresses, and a userspace program then
+    decides the real egress, so the route to the TUN says nothing about where
+    the traffic ends up. The main table still lists the LAN as directly
+    connected, so those prefixes stay refused whatever route is selected."""
+    main = _default_devices(family, "main")
+    ip = ipaddress.ip_address(address)
+    for r in _main_table(family):
+        if not isinstance(r, dict) or r.get("type", "unicast") != "unicast":
+            continue
+        dst = r.get("dst")
+        if not dst or dst == "default":
+            continue
+        hops = r.get("nexthops") if isinstance(r.get("nexthops"), list) else [r]
+        if any(isinstance(h, dict) and h.get("gateway") for h in hops):
+            continue                      # reached through a gateway, not on the link
+        devices = {h.get("dev") for h in hops if isinstance(h, dict) and h.get("dev")}
+        if devices and all(main.get(dev) is False for dev in devices):
+            continue                      # gateway-free routes of a point-to-point internet link
+        if ip in ipaddress.ip_network(dst, strict=False):
+            return True
+    return False
+
+
+def route_verdict(address):
+    """How the kernel would reach `address`:
+
+    - ROUTE_INTERNET: out through a gateway on a device that carries the
+      internet (possibly as a fragmented default, in the selected policy
+      table), or over a point-to-point internet link (full-tunnel VPN, PPP),
+      and not into a directly connected LAN prefix;
+    - ROUTE_FORBIDDEN: this machine, the LAN (including LAN devices with
+      public IPv6 addresses, also behind a TUN), a VPN-specific route or
+      anything else that isn't the internet;
+    - ROUTE_NONE: no route at all (for example IPv6 on an IPv4-only network),
+      or routing couldn't be read.
+
+    Only ROUTE_INTERNET addresses are ever connected to."""
     def compute():
+        family = "-6" if ":" in address else "-4"
         try:
-            family = "-6" if ":" in address else "-4"
             routes = _ip_json(family, "route", "get", address)
-            if not routes:
-                return True
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return ROUTE_NONE
+        if not routes:
+            return ROUTE_NONE             # e.g. "Network is unreachable"
+        try:
             for r in routes:
                 if not isinstance(r, dict) or r.get("type", "unicast") != "unicast" \
                         or not r.get("dev") or r.get("dev") == "lo":
-                    return True
+                    return ROUTE_FORBIDDEN
                 defaults = _default_devices(family, r.get("table", "main"))
                 if r["dev"] not in defaults:
-                    return True
+                    return ROUTE_FORBIDDEN
                 # Through a gateway, or a point-to-point internet route
                 # (full-tunnel VPN, PPP) whose gateway-free routes cover the internet.
                 if not r.get("gateway") and defaults[r["dev"]]:
-                    return True
+                    return ROUTE_FORBIDDEN
+            if _in_directly_connected_prefix(family, address):
+                return ROUTE_FORBIDDEN
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            return True
-        return False
+            return ROUTE_NONE             # can't be verified: never used
+        return ROUTE_INTERNET
     return _cached(("route", address), compute)
+
+
+def routes_to_this_machine(address):
+    """True unless `address` is reached over the internet (see route_verdict).
+    Fails closed: no route or unreadable routing counts as not reachable."""
+    return route_verdict(address) != ROUTE_INTERNET
 
 
 # Total request deadlines. A socket timeout only bounds each read, so a server
@@ -390,7 +443,12 @@ def _getaddrinfo(host, port):
 
 
 def resolve_public(host, port):
-    """All addresses for host:port, or BlockedAddress if any is non-public."""
+    """The addresses of host:port that are reachable over the internet.
+
+    Refuses the whole host (BlockedAddress) if any address is non-public or
+    routes to this machine, the LAN or anything else that isn't the internet.
+    Addresses the kernel has no route to at all, such as IPv6 on an IPv4-only
+    network, are left out and never connected to. OSError if none remain."""
     try:
         infos = _getaddrinfo(host, port)
     except (socket.gaierror, UnicodeError) as e:
@@ -398,13 +456,21 @@ def resolve_public(host, port):
     if not infos or len(infos) > MAX_ENDPOINTS:
         raise BlockedAddress(f"{host} did not resolve to a usable address")
     deadline = current_deadline()
+    usable = []
     for info in infos:
         if deadline is not None:
             deadline.check()
         address = info[4][0].split("%", 1)[0]
-        if not public_ip(address) or routes_to_this_machine(address):
+        if not public_ip(address):
             raise BlockedAddress(f"{host} is not a public internet address")
-    return infos
+        verdict = route_verdict(address)
+        if verdict == ROUTE_FORBIDDEN:
+            raise BlockedAddress(f"{host} is not a public internet address")
+        if verdict == ROUTE_INTERNET:
+            usable.append(info)
+    if not usable:
+        raise OSError(f"no route to {host} from this network")
+    return usable
 
 
 # Ports browsers refuse for HTTP (WHATWG Fetch "bad ports"), so a station
@@ -2097,7 +2163,7 @@ class Daemon:
             # or private-network address.
             self.station = station
             self.mode = "off"
-            self.error = "Station address is not on the public internet"
+            self.error = "Station isn't reachable on the public internet from here"
             self.publish()
             return
         if self.mpv.alive:

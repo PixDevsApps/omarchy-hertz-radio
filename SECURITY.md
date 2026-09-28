@@ -107,6 +107,16 @@ through the proxy, is made by `public_connection()`:
   That refuses this machine's own addresses, everything directly on the LAN
   (including LAN devices with public IPv6 addresses) and specific routes into
   VPNs.
+- Addresses inside a **directly connected prefix in the main table** are
+  refused even when a TUN or policy table captures them first. Behind a TUN,
+  a userspace proxy decides where traffic really goes, so the route to the
+  TUN can't show that a destination is on the LAN; the main table still
+  does. Point-to-point internet links (PPP, full-tunnel VPN) are exempt.
+- An address the kernel has **no route to at all** (for example IPv6 on an
+  IPv4-only network), or whose routing can't be read, is skipped and never
+  connected to; the host is used through its remaining addresses. Any
+  non-public address, or any address that routes to this machine, the LAN or
+  a VPN-specific route, still refuses the whole host.
 - The socket connects to exactly the checked address (no DNS rebinding).
 - Ports on the WHATWG Fetch "bad ports" list are refused. Logos must use
   ports 80 or 443. The directory API is HTTPS-only, redirects included.
@@ -189,6 +199,8 @@ python3 -m unittest discover -s tests -v
 | `tests/test_player_sandbox.py` | The real player against hostile URLs (loopback, LAN, redirect to loopback, `.m3u` and HLS playlists pointing at loopback, `tcp://`), with unsandboxed controls; public HTTP, HTTPS and HLS still play |
 | `tests/test_hardening.py` | Logo transcoding (all formats, decompression bombs, corrupt input, pinned decoder, PNG rebuild), a hostile fake mpv (lone surrogates, escape sequences, wrong types, nested JSON, huge strings), killing a player that ignores quit and SIGTERM, record validation, a corrupt session file, the IPC line cap, symlink-safe writes |
 | `tests/test_pause_latency.py` | Synthetic audio through the real sandboxed player and a paced PCM consumer, repeated Pause/Play, mute and volume preservation, failed player replacement, old IPC events, and cleanup of an old player record |
+| `tests/test_policy_routing.py` | Policy tables and TUNs such as sing-box: fragmented defaults with private holes, point-to-point links, partial VPN routes, no combining of coverage across devices or tables, non-unicast routes, read failures |
+| `tests/test_route_verdicts.py` | A TUN capturing a public IPv4 or IPv6 LAN (still refused), point-to-point and multipath routes, and dual-stack hosts on an IPv4-only network: the unroutable address is skipped and never connected to, while a forbidden or non-public address still refuses the host |
 
 Mutation checks were run for each layer: removing a protection makes its
 tests fail.

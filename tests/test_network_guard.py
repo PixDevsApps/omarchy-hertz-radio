@@ -108,9 +108,9 @@ class OpenerTest(unittest.TestCase):
     def test_redirect_hops_are_checked(self):
         # A "public" server (127.0.0.2, whitelisted only inside this test)
         # redirects to the loopback server. The hop must be refused.
-        original, original_route = hz.public_ip, hz.routes_to_this_machine
+        original, original_route = hz.public_ip, hz.route_verdict
         hz.public_ip = lambda a: a == "127.0.0.2" or original(a)
-        hz.routes_to_this_machine = lambda a: a != "127.0.0.2" and original_route(a)
+        hz.route_verdict = lambda a: hz.ROUTE_INTERNET if a == "127.0.0.2" else original_route(a)
         try:
             front, front_hits = serve("127.0.0.2", redirect_to=f"http://127.0.0.1:{self.port}/secret")
             try:
@@ -121,7 +121,7 @@ class OpenerTest(unittest.TestCase):
                 front.shutdown()
                 front.server_close()
         finally:
-            hz.public_ip, hz.routes_to_this_machine = original, original_route
+            hz.public_ip, hz.route_verdict = original, original_route
 
     def test_artwork_fetch_refuses_local_logo(self):
         art = hz.Artwork.__new__(hz.Artwork)  # no worker threads needed
@@ -318,14 +318,14 @@ class DeadlineTest(unittest.TestCase):
     past its total deadline, although each read is well within the socket timeout."""
 
     def setUp(self):
-        self.original = (hz.public_ip, hz.routes_to_this_machine, hz.ART_DEADLINE, hz.API_DEADLINE)
+        self.original = (hz.public_ip, hz.route_verdict, hz.ART_DEADLINE, hz.API_DEADLINE)
         hz.public_ip = lambda a: a == "127.0.0.2" or self.original[0](a)
-        hz.routes_to_this_machine = lambda a: a != "127.0.0.2" and self.original[1](a)
+        hz.route_verdict = lambda a: hz.ROUTE_INTERNET if a == "127.0.0.2" else self.original[1](a)
         hz.ART_DEADLINE = hz.API_DEADLINE = 2.0
         self.servers = []
 
     def tearDown(self):
-        hz.public_ip, hz.routes_to_this_machine, hz.ART_DEADLINE, hz.API_DEADLINE = self.original
+        hz.public_ip, hz.route_verdict, hz.ART_DEADLINE, hz.API_DEADLINE = self.original
         for server in self.servers:
             server.shutdown()
             server.server_close()
