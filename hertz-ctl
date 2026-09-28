@@ -212,23 +212,52 @@ def _cached(key, compute):
     return value
 
 
-def _default_devices(family):
-    """{device: has_gateway} for every default route (multipath included)."""
+def _default_devices(family, table="main"):
+    """Internet egress devices in one table, including fragmented defaults.
+
+    TUN policy routing may represent a default as many prefixes with private
+    and link-local holes. Only those non-public holes may be ignored when
+    proving coverage; public_ip() still rejects them for every connection.
+    Never combine coverage across devices or policy tables. Returned values
+    say whether the selected route must have a gateway.
+    """
     def compute():
-        devices = {}
-        for r in _ip_json(family, "route", "show", "default"):
-            if not isinstance(r, dict):
+        whole = ipaddress.ip_network("::/0" if family == "-6" else "0.0.0.0/0")
+        holes = [ipaddress.ip_network(n) for n in (
+            ("fc00::/7", "fe80::/10") if family == "-6" else
+            ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))]
+        networks, gateway_free = {}, {}
+
+        def covers_internet(nets):
+            return list(ipaddress.collapse_addresses(nets + holes)) == [whole]
+
+        for r in _ip_json(family, "route", "show", "table", str(table)):
+            if not isinstance(r, dict) or r.get("type", "unicast") != "unicast":
+                continue
+            dst = r.get("dst")
+            if not dst:
+                continue
+            network = whole if dst == "default" else ipaddress.ip_network(dst, strict=False)
+            if network.version != whole.version:
                 continue
             for hop in r.get("nexthops") if isinstance(r.get("nexthops"), list) else [r]:
-                if isinstance(hop, dict) and hop.get("dev"):
-                    devices[hop["dev"]] = devices.get(hop["dev"], False) or bool(hop.get("gateway"))
-        return devices
-    return _cached(("default", family), compute)
+                if isinstance(hop, dict) and hop.get("dev") and hop["dev"] != "lo":
+                    dev = hop["dev"]
+                    networks.setdefault(dev, []).append(network)
+                    if not hop.get("gateway"):
+                        gateway_free.setdefault(dev, []).append(network)
+        # A point-to-point default stays usable even if an unrelated, narrower
+        # route on that device has a gateway. A narrow on-link LAN route alone
+        # cannot qualify a device for gateway-free internet access.
+        return {dev: not covers_internet(gateway_free.get(dev, []))
+                for dev, nets in networks.items() if covers_internet(nets)}
+    return _cached(("default", family, str(table)), compute)
 
 
 def routes_to_this_machine(address):
     """True unless the kernel would send `address` out through a gateway on an
-    interface that carries a default route. That refuses this machine's own
+    interface that carries a default route (possibly fragmented, in the
+    selected policy table). That refuses this machine's own
     addresses, anything directly on the LAN (including LAN devices with
     public IPv6 addresses) and specific routes into VPNs or other networks.
     Fails closed if routing can't be read."""
@@ -236,19 +265,21 @@ def routes_to_this_machine(address):
         try:
             family = "-6" if ":" in address else "-4"
             routes = _ip_json(family, "route", "get", address)
-            defaults = _default_devices(family)
+            if not routes:
+                return True
+            for r in routes:
+                if not isinstance(r, dict) or r.get("type", "unicast") != "unicast" \
+                        or not r.get("dev") or r.get("dev") == "lo":
+                    return True
+                defaults = _default_devices(family, r.get("table", "main"))
+                if r["dev"] not in defaults:
+                    return True
+                # Through a gateway, or a point-to-point internet route
+                # (full-tunnel VPN, PPP) whose gateway-free routes cover the internet.
+                if not r.get("gateway") and defaults[r["dev"]]:
+                    return True
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return True
-        if not routes or not defaults:
-            return True
-        for r in routes:
-            if not isinstance(r, dict) or r.get("type") in ("local", "broadcast", "multicast") \
-                    or r.get("dev") == "lo" or r.get("dev") not in defaults:
-                return True
-            # Through a gateway, or through a point-to-point default route
-            # (full-tunnel VPN, PPP) whose default itself has no gateway.
-            if not r.get("gateway") and defaults[r.get("dev")]:
-                return True
         return False
     return _cached(("route", address), compute)
 
