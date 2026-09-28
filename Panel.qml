@@ -1,17 +1,14 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
-import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import "Model.js" as Model
 
 // Hertz Radio: bar icon + popup player with an expandable station browser.
 //
-// Everything outside the UI goes through ./hertz-ctl, a small long-running
-// helper that talks to Radio Browser, caches artwork and drives mpv over its
-// IPC socket (mpv-mpris then exposes playback to media keys). The panel only
-// renders the JSON snapshots it streams and sends one-line commands back.
+// All screens use the same Service.qml controller and hertz-ctl helper.
+// Only popup visibility, focus and keyboard selection belong to each panel.
 Panel {
   id: root
   moduleName: "io.github.pixdevsapps.hertz-radio"
@@ -19,36 +16,40 @@ Panel {
 
   // ---------------------------------------------------------------- state
 
-  property bool connected: false
-  property var station: null
-  property bool playing: false
-  property bool paused: false
-  property bool buffering: false
-  property string nowTitle: ""
-  property string codec: ""
-  property int volume: 70
-  property bool muted: false
-  property bool favorite: false
-  property bool hasNext: false
-  property string playError: ""
+  property var shell: null
+  readonly property var radio: {
+    var host = shell || (bar ? bar.shell : null)
+    return host ? host.serviceFor(moduleName) : null
+  }
 
-  property var genres: []
-  property string genre: "All"
-  property string searchText: ""
-  property string country: ""          // ISO code, "" = all countries
-  property var countries: []
-  property var stations: []
-  property var favorites: []
-  property var art: ({})
-  property int page: 0
-  property bool more: false
-  property bool loading: false
-  property string listError: ""
-  property bool fetched: false
+  readonly property bool connected: radio ? radio.connected : false
+  readonly property var station: radio ? radio.station : null
+  readonly property bool playing: radio ? radio.playing : false
+  readonly property bool paused: radio ? radio.paused : false
+  readonly property bool buffering: radio ? radio.buffering : false
+  readonly property string nowTitle: radio ? radio.nowTitle : ""
+  readonly property string codec: radio ? radio.codec : ""
+  readonly property int volume: radio ? radio.volume : 70
+  readonly property bool muted: radio ? radio.muted : false
+  readonly property bool favorite: radio ? radio.favorite : false
+  readonly property bool hasNext: radio ? radio.hasNext : false
+  readonly property string playError: radio ? radio.playError : ""
+  readonly property var genres: radio ? radio.genres : []
+  readonly property string genre: radio ? radio.genre : "All"
+  readonly property string searchText: radio ? radio.searchText : ""
+  readonly property string country: radio ? radio.country : ""
+  readonly property var countries: radio ? radio.countries : []
+  readonly property var stations: radio ? radio.stations : []
+  readonly property var favorites: radio ? radio.favorites : []
+  readonly property var art: radio ? radio.art : ({})
+  readonly property int page: radio ? radio.page : 0
+  readonly property bool more: radio ? radio.more : false
+  readonly property bool loading: radio ? radio.loading : false
+  readonly property string listError: radio ? radio.listError : ""
+  readonly property bool fetched: radio ? radio.fetched : false
   property int cursor: -1
 
   property bool browsing: false
-  property bool volumeDragging: false
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color accent: Color.accent
@@ -72,145 +73,28 @@ Panel {
   }
   readonly property bool live: playing && !buffering
 
-  // ---------------------------------------------------------------- backend
-
-  readonly property string ctlPath: decodeURIComponent(String(Qt.resolvedUrl("hertz-ctl")).replace(/^file:\/\//, ""))
-
-  function send(line) {
-    if (backend.running) backend.write(line + "\n")
-  }
-
-  function search(pageNumber) {
-    page = pageNumber || 0
-    loading = true
-    listError = ""
-    fetched = true
-    send("search " + JSON.stringify({ genre: genre, country: country, text: searchText, page: page }))
-  }
-
-  // Infinite scroll: fetch the next page once the list nears its end.
-  function loadMore() {
-    if (more && !loading && listError === "" && genre !== "Favorites" && stations.length > 0)
-      search(page + 1)
-  }
-
-  function selectCountry(code) {
-    if (country === code && fetched) return
-    country = code
-    cursor = -1
-    stationList.positionViewAtBeginning()
-    search(0)
-  }
-
-  function selectGenre(name) {
-    if (genre === name && fetched) return
-    genre = name
-    cursor = -1
-    stationList.positionViewAtBeginning()
-    search(0)
-  }
-
+  // Each screen renders the shared service, with its own popup and focus.
+  function send(line) { if (radio) radio.send(line) }
+  function search(pageNumber) { if (radio) radio.search(pageNumber) }
+  function loadMore() { if (radio) radio.loadMore() }
+  function selectCountry(code) { if (radio) radio.selectCountry(code) }
+  function selectGenre(name) { if (radio) radio.selectGenre(name) }
+  function setSearchText(text) { if (radio) radio.setSearchText(text) }
   function play(uuid) { send("play " + uuid) }
   function playPause() { send("toggle") }
   function next() { send("next") }
   function prev() { send("prev") }
   function stop() { send("stop") }
   function toggleFavorite(uuid) { if (uuid) send("fav " + uuid) }
-  function setVolume(v) {
-    volume = Math.max(0, Math.min(100, Math.round(v)))
-    send("volume " + volume)
-  }
-
+  function setVolume(value) { if (radio) radio.setVolume(value) }
   function artFor(uuid) { return art[uuid] || "" }
 
-  function handle(line) {
-    var msg
-    try { msg = JSON.parse(line) } catch (e) { return }
-    if (msg.type === "state") {
-      station = msg.station || null
-      playing = !!msg.playing
-      paused = !!msg.paused
-      buffering = !!msg.buffering
-      nowTitle = msg.title || ""
-      codec = msg.codec || ""
-      if (!volumeDragging) volume = msg.volume
-      muted = !!msg.muted
-      favorite = !!msg.favorite
-      hasNext = !!msg.hasNext
-      playError = msg.error || ""
-    } else if (msg.type === "stations") {
-      if (msg.key !== currentKey) return
-      if (msg.page > 0) {
-        // Rankings can shift between pages; never show a station twice.
-        var have = {}
-        for (var i = 0; i < stations.length; i++) have[stations[i].uuid] = true
-        stations = stations.concat(msg.items.filter(function(s) { return !have[s.uuid] }))
-      } else {
-        stations = msg.items
-      }
-      more = !!msg.more
-      if (!msg.cached) loading = false
-      listError = ""
-    } else if (msg.type === "loading") {
-      if (msg.key === currentKey) loading = true
-    } else if (msg.type === "stations-failed") {
-      if (msg.key !== currentKey) return
-      loading = false
-      listError = msg.message || "Radio directory unreachable"
-      if (msg.page > 0) page = msg.page - 1   // so a retry asks for the same page
-    } else if (msg.type === "favorites") {
-      favorites = msg.items || []
-      if (genre === "Favorites" && fetched) search(0)
-    } else if (msg.type === "art") {
-      var next = Object.assign({}, art)
-      next[msg.uuid] = msg.path
-      art = next
-    } else if (msg.type === "genres") {
-      var list = msg.items || []
-      var i = list.indexOf("All")
-      genres = (i >= 0 ? ["All", "Favorites"].concat(list.slice(0, i), list.slice(i + 1)) : ["Favorites"].concat(list))
-      if (msg.current && genres.indexOf(msg.current) >= 0 && !fetched) genre = msg.current
-      if (!fetched) country = msg.country || ""
-    } else if (msg.type === "countries") {
-      countries = msg.items || []
-    } else if (msg.type === "error") {
-      playError = msg.message || ""
-    }
+  function resetListPosition() {
+    cursor = -1
+    stationList.positionViewAtBeginning()
   }
-
-  Process {
-    id: backend
-    command: ["python3", root.ctlPath, "daemon"]
-    running: true
-    stdinEnabled: true
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function(data) { root.handle(data) }
-    }
-    stderr: SplitParser {
-      onRead: function(data) { console.warn("hertz-ctl:", data) }
-    }
-    onRunningChanged: {
-      root.connected = running
-      if (running && root.fetched) Qt.callLater(function() { root.search(0) })
-    }
-    onExited: function(code) {
-      root.connected = false
-      restartTimer.start()
-    }
-  }
-
-  Timer {
-    id: restartTimer
-    interval: 3000
-    onTriggered: backend.running = true
-  }
-
-  Timer {
-    id: searchDebounce
-    interval: 380
-    onTriggered: root.search(0)
-  }
+  onCurrentKeyChanged: resetListPosition()
+  onRadioChanged: if (radio && opened && !fetched) search(0)
 
   onBrowsingChanged: {
     if (browsing && countries.length === 0) send("countries")
@@ -369,7 +253,7 @@ Panel {
       property bool enterPressed: false
 
       onCloseRequested: {
-        if (root.searchText !== "") { searchField.text = "" }
+        if (root.searchText !== "") { root.setSearchText("") }
         else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -633,7 +517,6 @@ Panel {
               integer: true
               value: root.volume
               opacity: root.muted ? 0.45 : 1
-              onDraggingChanged: root.volumeDragging = dragging
               onMoved: function(v) { root.setVolume(v) }
               onRightClicked: root.send("mute")
             }
@@ -737,13 +620,10 @@ Panel {
               placeholderText: Model.ICON.search + "  Search stations"
               leftPadding: Style.spacing.controlPaddingX
               rightPadding: clearSearch.visible ? clearSearch.width + Style.space(10) : Style.spacing.controlPaddingX
-              onTextChanged: {
-                root.searchText = text
-                root.cursor = -1
-                searchDebounce.restart()
-              }
+              text: root.searchText
+              onTextEdited: root.setSearchText(text)
               Keys.onEscapePressed: function(event) {
-                if (text !== "") text = ""
+                if (text !== "") root.setSearchText("")
                 else keys.forceActiveFocus()
                 event.accepted = true
               }
@@ -753,7 +633,6 @@ Panel {
                 event.accepted = true
               }
               Keys.onReturnPressed: function(event) {
-                searchDebounce.stop()
                 root.search(0)
                 keys.forceActiveFocus()
                 if (root.stations.length) root.cursor = 0
@@ -777,7 +656,7 @@ Panel {
                   anchors.margins: -Style.space(4)
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: searchField.text = ""
+                  onClicked: root.setSearchText("")
                 }
               }
             }
