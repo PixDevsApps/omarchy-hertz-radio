@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.2 — 2026-09-28
+
+- The logo decoder's output is bounded while it is read, not after: at most
+  256 KB of stdout is ever held, stderr is drained without being kept, and
+  the whole run has one deadline. On overflow or timeout the sandbox is killed
+  with everything in it. Previously ffmpeg's complete output was buffered
+  before its size was checked.
+
 ## 1.2.1 — 2026-09-28
 
 - **Pause stops the sound at once** (#3, by @Wolfengo). Pause, Off and station

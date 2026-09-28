@@ -303,12 +303,12 @@ class PngRebuildTest(unittest.TestCase):
 
     def test_ffmpeg_is_told_the_input_format(self):
         seen = []
-        real_run = hz.subprocess.run
+        real_run = hz.run_bounded
 
-        def capture(cmd, **kw):
+        def capture(cmd, data, limit, timeout, **kw):
             seen.append(cmd)
-            return subprocess.CompletedProcess(cmd, 1, b"", b"")
-        hz.subprocess.run = capture
+            return None
+        hz.run_bounded = capture
         try:
             samples = {".png": b"\x89PNG\r\n\x1a\n" + b"0" * 32, ".jpg": b"\xff\xd8\xff" + b"0" * 32,
                        ".gif": b"GIF89a" + b"0" * 32, ".webp": b"RIFF0000WEBP" + b"0" * 32,
@@ -320,7 +320,7 @@ class PngRebuildTest(unittest.TestCase):
                 self.assertEqual(cmd[cmd.index("-i") - 1], hz.LOGO_DEMUXERS[ext], ext)
                 self.assertEqual(cmd[cmd.index("-i") - 2], "-f", ext)
         finally:
-            hz.subprocess.run = real_run
+            hz.run_bounded = real_run
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("bwrap"), "needs ffmpeg and bubblewrap")
     def test_decoder_is_pinned_to_the_sniffed_format(self):

@@ -53,7 +53,7 @@ import urllib.parse
 import urllib.request
 import zlib
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 USER_AGENT = f"HertzRadio/{VERSION} (Omarchy plugin; +https://github.com/PixDevsApps/omarchy-hertz-radio)"
 HERE = os.path.dirname(os.path.realpath(__file__))
 
@@ -1136,16 +1136,85 @@ def transcode_logo(data):
         resource.setrlimit(resource.RLIMIT_STACK, (2 << 20, 2 << 20))
         resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
     try:
-        out = subprocess.run(cmd, input=data, capture_output=True, timeout=LOGO_TIMEOUT,
-                             pass_fds=fds, preexec_fn=limits)
-    except (OSError, subprocess.TimeoutExpired):
+        result = run_bounded(cmd, data, LOGO_OUTPUT_LIMIT, LOGO_TIMEOUT, pass_fds=fds, preexec_fn=limits)
+    except OSError:
         return None
     finally:
         for fd in fds:
             os.close(fd)
-    if out.returncode != 0 or len(out.stdout) > 256 * 1024:
+    if result is None or result[0] != 0:
         return None
-    return rebuild_png(out.stdout)
+    return rebuild_png(result[1])
+
+
+def run_bounded(cmd, data, limit, timeout, **popen_args):
+    """Run `cmd` with `data` on stdin and return (returncode, stdout), or None.
+
+    stdout is read as it arrives and at most `limit` bytes are ever held: one
+    byte more means overflow, and the process is killed and the result
+    refused. stderr is drained and discarded, so neither stream can grow our
+    memory. The whole run shares one deadline; on timeout or overflow the
+    process is killed (for a bubblewrap sandbox that ends everything in it,
+    since the sandbox is its own PID namespace)."""
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, **popen_args)
+    out = bytearray()
+    overflow = threading.Event()
+
+    def feed():
+        try:
+            proc.stdin.write(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def collect():
+        try:
+            fd = proc.stdout.fileno()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return
+                if len(out) + len(chunk) > limit:
+                    overflow.set()
+                    proc.kill()
+                    return
+                out.extend(chunk)
+        except OSError:
+            return
+        finally:
+            proc.stdout.close()          # each reader closes only its own pipe
+
+    def drain():
+        try:
+            fd = proc.stderr.fileno()
+            while os.read(fd, 65536):
+                pass
+        except OSError:
+            pass
+        finally:
+            proc.stderr.close()
+
+    workers = [threading.Thread(target=f, daemon=True) for f in (feed, collect, drain)]
+    for w in workers:
+        w.start()
+    deadline = time.monotonic() + timeout
+    try:
+        proc.wait(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    for w in workers:
+        w.join(max(0.0, min(1.0, deadline + 1.0 - time.monotonic())))
+    if timed_out or overflow.is_set() or any(w.is_alive() for w in workers):
+        return None
+    return proc.returncode, bytes(out)
 
 
 def _png_chunk(kind, body):
@@ -1204,6 +1273,7 @@ LOGO_SIZE = 160
 LOGO_MAX_PIXELS = 4096 * 4096
 LOGO_MEMORY = 512 * 1024 * 1024
 LOGO_TIMEOUT = 15
+LOGO_OUTPUT_LIMIT = 256 * 1024     # ffmpeg's PNG output, enforced while reading
 
 
 def private_dir(path):

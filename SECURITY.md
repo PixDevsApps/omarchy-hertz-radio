@@ -132,7 +132,10 @@ through the proxy, is made by `public_connection()`:
 A logo is downloaded as bytes (at most 768 KB), must look like PNG, JPEG,
 GIF, WebP, ICO or BMP, and is decoded **only** by ffmpeg in the sandbox. ffmpeg
 is told the input format from the sniffed type (it doesn't probe) and writes
-a PNG of at most 160×160. `rebuild_png()` then parses that output strictly
+a PNG of at most 160×160. Its output is bounded while it is read: at most
+256 KB of stdout is ever held (one byte more is refused), stderr is drained
+without being kept, and the whole run has one deadline. On overflow or timeout
+the sandbox is killed, which ends every process inside it. `rebuild_png()` then parses that output strictly
 (8-bit RGBA, no interlacing, valid CRCs, known chunks only, exact
 decompressed size, valid filter bytes, bounded decompression) and writes a
 **fresh PNG from the pixel data**. That rebuilt PNG is all that's cached and
@@ -201,6 +204,7 @@ python3 -m unittest discover -s tests -v
 | `tests/test_pause_latency.py` | Synthetic audio through the real sandboxed player and a paced PCM consumer, repeated Pause/Play, mute and volume preservation, failed player replacement, old IPC events, and cleanup of an old player record |
 | `tests/test_policy_routing.py` | Policy tables and TUNs such as sing-box: fragmented defaults with private holes, point-to-point links, partial VPN routes, no combining of coverage across devices or tables, non-unicast routes, read failures |
 | `tests/test_route_verdicts.py` | A TUN capturing a public IPv4 or IPv6 LAN (still refused), point-to-point and multipath routes, and dual-stack hosts on an IPv4-only network: the unroutable address is skipped and never connected to, while a forbidden or non-public address still refuses the host |
+| `tests/test_bounded_output.py` | The logo decoder's output limits inside the real sandbox: a stdout flood is cut at the limit, a stderr flood or stall ends at the deadline, no process survives, memory stays bounded, and the decoder goes through the bounded runner |
 
 Mutation checks were run for each layer: removing a protection makes its
 tests fail.
