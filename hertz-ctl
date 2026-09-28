@@ -84,12 +84,9 @@ FALLBACK_MIRRORS = [
     "https://fi1.api.radio-browser.info",
     "https://nl1.api.radio-browser.info",
 ]
-# Paused radio should not keep downloading. Pausing from the panel drops the
-# stream at once; a pause from media keys (MPRIS) keeps it this many seconds so
-# a quick resume is instant, then drops it too. Play always rejoins live.
+# Panel and media-key Pause end the player session. If mpv itself reports a
+# pause, allow a short resume window before disconnecting that stream too.
 DISCONNECT_AFTER = 10.0
-# An idle player left behind by a pause is shut down after this long.
-IDLE_QUIT_AFTER = 300.0
 
 out_lock = threading.Lock()
 
@@ -1572,6 +1569,7 @@ class Mpv:
         self.sock = None
         self.lock = threading.Lock()
         self.request_id = 0
+        self.generation = 0
 
     @property
     def alive(self):
@@ -1631,13 +1629,16 @@ class Mpv:
         return False
 
     def _adopt(self, s):
-        self.sock = s
-        threading.Thread(target=self._reader, args=(s,), daemon=True).start()
+        with self.lock:
+            self.sock = s
+            self.generation += 1
+            generation = self.generation
+        threading.Thread(target=self._reader, args=(s, generation), daemon=True).start()
         for i, name in enumerate(self.OBSERVED, 1):
             self.command("unobserve_property", i)    # a previous daemon's observers
             self.command("observe_property", i, name)
 
-    def _reader(self, s):
+    def _reader(self, s, generation):
         buf = bytearray()
         try:
             while True:
@@ -1661,7 +1662,7 @@ class Mpv:
                         continue
                     if isinstance(msg, dict):
                         try:
-                            self.on_event(msg)
+                            self.on_event(dict(msg, _hertz_generation=generation))
                         except Exception as e:   # a malformed message must not stop the reader
                             log("mpv event ignored:", type(e).__name__)
         except OSError:
@@ -1669,7 +1670,8 @@ class Mpv:
         with self.lock:
             if self.sock is s:
                 self.sock = None
-        self.on_event({"event": "hertz-disconnected"})
+        s.close()
+        self.on_event({"event": "hertz-disconnected", "_hertz_generation": generation})
 
     def command(self, *args):
         with self.lock:
@@ -1686,19 +1688,33 @@ class Mpv:
     def quit(self):
         self.command("quit")
 
-    def terminate(self, wait=False):
-        """Ask mpv to quit, and make sure the whole player session is gone a
-        few seconds later even if the sandboxed player ignores the request."""
+    def terminate(self, wait=False, grace=PLAYER_QUIT_GRACE):
+        """Ask mpv to quit, then end its session after the requested grace period."""
+        info = read_json(PID_FILE, {})
         self.quit()
         if wait:
-            self.kill_player(grace=PLAYER_QUIT_GRACE)
+            # A later Play must start a fresh session. Invalidate queued events
+            # before closing: the reader may still be waiting for the daemon lock.
+            with self.lock:
+                old, self.sock = self.sock, None
+                self.generation += 1
+            if old is not None:
+                try:
+                    old.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                old.close()
+            self.kill_player(grace=grace, info=info)
         else:
-            threading.Thread(target=self.kill_player, kwargs={"grace": PLAYER_QUIT_GRACE},
+            threading.Thread(target=self.kill_player, kwargs={"grace": grace, "info": info},
                              daemon=True).start()
 
     @staticmethod
-    def kill_player(grace=0.0):
-        info = read_json(PID_FILE, {})
+    def kill_player(grace=0.0, info=None):
+        # Capture before starting a background killer; a later Play may replace
+        # the record while that thread is waiting to run.
+        if info is None:
+            info = read_json(PID_FILE, {})
         pid, start = info.get("pid"), info.get("start")
         if not isinstance(pid, int) or pid <= 1 or not start:
             return
@@ -1716,7 +1732,7 @@ class Mpv:
             end = time.monotonic() + pause
             while alive() and time.monotonic() < end:
                 time.sleep(0.1)
-        if not alive():
+        if not alive() and read_json(PID_FILE, {}) == info:
             try:
                 os.unlink(PID_FILE)
             except OSError:
@@ -1894,7 +1910,7 @@ class Daemon:
         self.queue = []         # list the playing station was picked from
         self.muted = False
         # "off": no player, no network | "playing" | "paused": stream dropped
-        # (or, briefly after an MPRIS pause, held) with the station kept.
+        # (or, briefly after a pause reported by mpv, held) with the station kept.
         self.mode = "off"
         self.pause_timer = None
         self.idle = True
@@ -1957,6 +1973,8 @@ class Daemon:
 
     def on_mpv(self, msg):
         with self.lock:
+            if "_hertz_generation" in msg and msg["_hertz_generation"] != self.mpv.generation:
+                return
             self._on_mpv(msg)
 
     def _on_mpv(self, msg):
@@ -1969,7 +1987,7 @@ class Daemon:
                 return
             if name == "pause":
                 if data and self.mode == "playing":
-                    # Paused from outside (media keys): hold briefly, then disconnect.
+                    # mpv reported a pause: hold briefly, then disconnect.
                     self.mode = "paused"
                     self.schedule(DISCONNECT_AFTER, self.disconnect_if_paused)
                     self.save_session()
@@ -2051,8 +2069,8 @@ class Daemon:
             self.error = "Station address is not on the public internet"
             self.publish()
             return
-        if not self.mpv.start(self.volume):
-            return
+        if self.mpv.alive:
+            self.stop_player()
         self.station = station
         if source is None and not any(q["uuid"] == station["uuid"] for q in self.queue):
             _, source = self.find(station["uuid"])
@@ -2060,10 +2078,17 @@ class Daemon:
             self.queue = list(source)[:200]
         self.title = ""
         self.error = ""
-        self.mode = "playing"
         self.cancel_timer()
         self.clicked = None
+        if not self.mpv.start(self.volume):
+            self.mode = "off"
+            self.error = "The radio player could not start"
+            self.save_session()
+            self.publish()
+            return
+        self.mode = "playing"
         self.mpv.command("set_property", "pause", False)
+        self.mpv.command("set_property", "mute", self.muted)
         self.mpv.command("loadfile", station["url"], "replace", -1,
                          {"force-media-title": station["name"]})
         self.save()
@@ -2087,8 +2112,8 @@ class Daemon:
             return
         self.mode = "paused"
         self.title = ""
-        self.mpv.command("stop")
-        self.schedule(IDLE_QUIT_AFTER, self.quit_if_paused)
+        self.cancel_timer()
+        self.stop_player()
         self.save_session()
         self.publish()
 
@@ -2096,9 +2121,14 @@ class Daemon:
         if self.mode == "paused" and self.loaded:
             self.pause()
 
-    def quit_if_paused(self):
-        if self.mode == "paused":
-            self.mpv.terminate()
+    def stop_player(self):
+        # mpv's PCM writer and the external audio process have separate queues.
+        # Stopping mpv alone leaves old audio playing. End both now; Play already
+        # reconnects to the live broadcast instead of resuming buffered audio.
+        self.mpv.terminate(wait=True, grace=0.0)
+        self.loaded = False
+        self.idle = True
+        self.buffering = False
 
     def schedule(self, delay, fn):
         self.cancel_timer()
@@ -2124,7 +2154,7 @@ class Daemon:
         self.cancel_timer()
         self.error = ""
         self.title = ""
-        self.mpv.terminate()
+        self.stop_player()
         self.save_session()
         self.publish()
 

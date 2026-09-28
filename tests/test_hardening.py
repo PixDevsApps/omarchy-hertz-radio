@@ -342,7 +342,7 @@ class RobustnessTest(unittest.TestCase):
         a, b = socket.socketpair()
         got = []
         m = hz.Mpv(got.append)
-        t = threading.Thread(target=m._reader, args=(a,), daemon=True)
+        t = threading.Thread(target=m._reader, args=(a, m.generation), daemon=True)
         t.start()
         b.sendall(b'{"event":"x","data":"' + b"a" * (hz.MAX_IPC_LINE + 10) + b'"}\n{"event":"ok"}\n')
         b.close()
