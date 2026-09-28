@@ -124,15 +124,22 @@ To bind the panel to a key, call its IPC target, for example
 ## How it works
 
 ```
-Panel.qml ◀──JSON lines──▶ hertz-ctl daemon ──▶ Radio Browser API (HTTPS), logo downloads
-                               │    └────────▶ MPRIS (media keys, omarchy.media)
-                               ▼
-                    hertz-ctl player session
-                      ├─ guarded proxy ◀── the only network path out of the sandbox
-                      ├─ sandbox: mpv ── raw PCM ──▶ pw-cat ──▶ PipeWire
-                      └─ sandbox: ffmpeg (logo → small PNG, no network)
+Panels on all screens
+        │ shared state and controls
+        ▼
+Service.qml ◀──JSON lines──▶ hertz-ctl daemon ──▶ Radio Browser API (HTTPS), logo downloads
+                                  │    └──────▶ MPRIS (media keys, omarchy.media)
+                                  ▼
+                        hertz-ctl player session
+                          ├─ guarded proxy ◀── the only network path out of the sandbox
+                          ├─ sandbox: mpv ── raw PCM ──▶ pw-cat ──▶ PipeWire
+                          └─ sandbox: ffmpeg (logo → small PNG, no network)
 ```
 
+- All screens share one radio service and one helper process. Playback,
+  volume, favorites, search filters and results stay in sync. Each screen has
+  its own popup, focus and keyboard selection. Removing a screen does not
+  stop the radio. This uses the service interface of Omarchy's built-in bar.
 - `hertz-ctl` handles the network, the files and the player. The QML only
   renders the snapshots it receives.
 - Radio Browser mirrors are discovered from `all.api.radio-browser.info` and

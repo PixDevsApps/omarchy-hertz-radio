@@ -16,10 +16,12 @@
     "player"
   ],
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "Hertz Radio",
